@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-	  <PackageReference Include="ServerEmus.ServerShared" Version="0.0.14" />
+	  <PackageReference Include="ServerEmus.ServerShared" Version="0.0.16" />
     <ProjectReference Include="..\Plugin.UplayServer.Quazal\Plugin.UplayServer.Quazal.csproj" />
   </ItemGroup>
 

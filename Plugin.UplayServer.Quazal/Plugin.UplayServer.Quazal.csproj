@@ -8,12 +8,27 @@
   </PropertyGroup>
 
 	<ItemGroup>
-	  <PackageReference Include="ServerEmus.ServerShared" Version="0.0.14" PrivateAssets="all" ExcludeAssets="runtime" ReferenceOutputAssembly="false" Private="true">
+	  <PackageReference Include="ServerEmus.ServerShared" Version="0.0.16" PrivateAssets="all" ExcludeAssets="runtime" ReferenceOutputAssembly="false" Private="true">
 		  <IncludeAssets>compile; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
 	  </PackageReference>
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Plugin.UplayServer.Quazal.Tests" />
+    <InternalsVisibleTo Include="GameClientTestHarness" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="ModdableWebServer" />
+    <Using Include="ModdableWebServer.Attributes" />
+    <Using Include="ModdableWebServer.Helper" />
+    <Using Include="ModdableWebServer.Senders" />
+    <Using Include="System.Text.Json" />
     <Using Include="Serilog" />
   </ItemGroup>
 
