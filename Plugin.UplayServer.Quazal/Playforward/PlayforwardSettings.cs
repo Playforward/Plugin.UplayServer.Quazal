@@ -71,7 +71,11 @@ public sealed class PlayforwardSettings
     public bool Enabled { get; set; }
 
     /// <summary>
-    /// The raw Ed25519 public ke
+    /// A pinned Ed25519 public key, raw and base64url (the JWKS <c>"x"</c>
+    /// value), for a LAN server with no route to Playforward or no TLS to it.
+    /// Leave it empty and the keys are read from Playforward's JWKS at
+    /// <see cref="BaseUrl"/>, by key id, which is what lets a signing-key
+    /// rotation need nothing done here.
     /// </summary>
     public string PublicKeyBase64 { get; set; } = string.Empty;
 
@@ -207,8 +211,8 @@ public sealed class PlayforwardSettings
             yield break;
         }
 
-        if (string.IsNullOrWhiteSpace(PublicKeyBase64))
-            yield return "Playforward.PublicKeyBase64 is required when Playforward is enabled";
+        if (string.IsNullOrWhiteSpace(PublicKeyBase64) && string.IsNullOrWhiteSpace(BaseUrl))
+            yield return "Playforward.BaseUrl is required when Playforward is enabled: it is where the keys tokens are checked with are read from, unless PublicKeyBase64 pins one";
         if (string.IsNullOrWhiteSpace(Issuer))
             yield return "Playforward.Issuer is required";
         if (string.IsNullOrWhiteSpace(AudiencePrefix) || AudiencePrefix.Contains(':'))

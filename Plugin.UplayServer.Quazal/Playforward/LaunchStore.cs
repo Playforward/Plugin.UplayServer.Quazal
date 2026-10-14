@@ -46,6 +46,18 @@ internal sealed class LaunchStore
     {
         public IssuedLaunch Launch { get; set; } = launch;
         public ActivityStamp LastActive { get; } = new(now);
+
+        /// <summary>
+        /// Guards <see cref="BoundTo"/> and <see cref="LastCounter"/>, which a
+        /// KEEP checks and moves together.
+        /// </summary>
+        public object Gate { get; } = new();
+
+        /// <summary>The socket this launch was last proved from: the only one a KEEP is taken from.</summary>
+        public IPEndPoint? BoundTo { get; set; }
+
+        /// <summary>The highest KEEP counter accepted since that proof.</summary>
+        public ulong LastCounter { get; set; }
     }
 
     private readonly ConcurrentDictionary<string, LiveLaunch> _launches = new(StringComparer.Ordinal);
@@ -138,8 +150,77 @@ internal sealed class LaunchStore
         }
 
         _challenges.TryRemove(id, out _);
+        lock (live.Gate)
+        {
+            live.BoundTo = from;
+            live.LastCounter = 0;
+        }
         live.LastActive.Touch(_time.GetUtcNow());
+        RetireOthersBoundTo(from, id);
         return (launch.Player, LaunchEnvelope.Bound(launch.Key, launch.IdBytes, pending.Challenge));
+    }
+
+    /// <summary>
+    /// Checks a KEEP: it must come from the socket the launch was proved from,
+    /// carry a counter higher than any before it, and be authenticated with the
+    /// launch's key. On success the launch is kept alive, and its player and the
+    /// ALIVE reply come back; on any failure, null.
+    /// </summary>
+    public (ResolvedPlayer Player, byte[] Alive)? Keep(ReadOnlySpan<byte> launchId, IPEndPoint from, ReadOnlySpan<byte> body)
+    {
+        Prune();
+
+        string id = Convert.ToHexString(launchId).ToLowerInvariant();
+        if (!_launches.TryGetValue(id, out LiveLaunch? live))
+            return null;
+
+        IssuedLaunch launch = live.Launch;
+        (ulong counter, byte[] mac) = LaunchEnvelope.ReadKeep(body);
+        if (!CryptographicOperations.FixedTimeEquals(LaunchEnvelope.ExpectedKeep(launch.Key, launch.IdBytes, counter), mac))
+        {
+            Log.Debug("[playforward] refused a KEEP from {From} that is not authenticated with its launch's key", from);
+            return null;
+        }
+
+        lock (live.Gate)
+        {
+            if (live.BoundTo is null || !live.BoundTo.Equals(from))
+            {
+                Log.Debug("[playforward] refused a KEEP from {From}: its launch was proved from {Proved}", from, live.BoundTo);
+                return null;
+            }
+            if (counter <= live.LastCounter)
+            {
+                Log.Debug("[playforward] refused a KEEP from {From} replaying counter {Counter}", from, counter);
+                return null;
+            }
+            live.LastCounter = counter;
+        }
+
+        live.LastActive.Touch(_time.GetUtcNow());
+        return (launch.Player, LaunchEnvelope.Alive(launch.Key, launch.IdBytes, counter));
+    }
+
+    /// <summary>
+    /// Drops every other launch proved from a socket, once a new one has been:
+    /// a renewal replaces the launch it renews, and one game socket carries
+    /// one launch.
+    /// </summary>
+    private void RetireOthersBoundTo(IPEndPoint socket, string keptId)
+    {
+        foreach ((string id, LiveLaunch live) in _launches)
+        {
+            if (id == keptId)
+                continue;
+            bool sameSocket;
+            lock (live.Gate)
+                sameSocket = socket.Equals(live.BoundTo);
+            if (sameSocket)
+            {
+                _launches.TryRemove(id, out _);
+                _challenges.TryRemove(id, out _);
+            }
+        }
     }
 
     /// <summary>

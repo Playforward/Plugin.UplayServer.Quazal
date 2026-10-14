@@ -5,6 +5,7 @@ using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Crypto.Signers;
 using Org.BouncyCastle.Security;
+using Plugin.UplayServer.Quazal.Playforward;
 
 namespace Plugin.UplayServer.Quazal.Tests;
 
@@ -44,7 +45,8 @@ internal sealed class PlayforwardTokenFactory
         string algorithm = "EdDSA",
         DateTimeOffset? expiresAt = null,
         DateTimeOffset? notBefore = null,
-        string? tokenId = null)
+        string? tokenId = null,
+        string? keyId = null)
     {
         var now = DateTimeOffset.UtcNow;
         string payload = JsonSerializer.Serialize(new
@@ -67,7 +69,7 @@ internal sealed class PlayforwardTokenFactory
             exp = (expiresAt ?? now.AddMinutes(1)).ToUnixTimeSeconds(),
         }, OmitNulls);
 
-        return Sign(payload, algorithm);
+        return Sign(payload, algorithm, keyId);
     }
 
     /// <summary>
@@ -118,12 +120,22 @@ internal sealed class PlayforwardTokenFactory
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
     };
 
-    private string Sign(string payload, string algorithm)
+    /// <summary>This key's id, derived as Playforward derives one (internal/auth/signingkey.go).</summary>
+    public string KeyId => SigningKeys.KeyIdOf(PublicKey);
+
+    /// <summary>A JWKS document publishing this key, shaped like Playforward's.</summary>
+    public string Jwks() => JsonSerializer.Serialize(new
+    {
+        keys = new[] { new { kty = "OKP", crv = "Ed25519", x = PublicKeyBase64Url, use = "sig", alg = "EdDSA", kid = KeyId } },
+    });
+
+    /// <param name="keyId">The header's <c>kid</c>; this key's own unless a test names another.</param>
+    private string Sign(string payload, string algorithm, string? keyId = null)
     {
         string header = JsonSerializer.Serialize(new
         {
             alg = algorithm,
-            kid = "test-key",
+            kid = keyId ?? KeyId,
         });
 
         string signingInput =

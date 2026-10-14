@@ -109,6 +109,40 @@ internal static class PlayforwardRoutes
     }
 
     /// <summary>
+    /// GET /playforward/status
+    ///   -> 200 {"time": unix seconds, "titles": [{"title_id": "...", "server_id": "...",
+    ///           "key_ids": ["..."], "clock_skew_seconds": n}]}
+    ///
+    /// </summary>
+    [HTTP("GET", StatusPath)]
+    public static bool Status(ServerSender server)
+    {
+        if (!PlayforwardTitles.Any)
+        {
+            Respond(server, 503, """{"error":"playforward login is not enabled on this server"}""");
+            return true;
+        }
+        Respond(server, 200, StatusDocument(PlayforwardTitles.All, DateTimeOffset.UtcNow));
+        return true;
+    }
+
+    internal const string StatusPath = "/playforward/status";
+
+    /// <summary>The body of <see cref="Status"/>, for these titles at this time.</summary>
+    internal static string StatusDocument(IEnumerable<PlayforwardTitle> titles, DateTimeOffset now) =>
+        JsonSerializer.Serialize(new
+        {
+            time = now.ToUnixTimeSeconds(),
+            titles = titles.Select(title => new
+            {
+                title_id = title.TitleId,
+                server_id = title.ServerId,
+                key_ids = title.Gateway.Verifier.Keys.KeyIds,
+                clock_skew_seconds = (int)title.Gateway.Verifier.ClockSkew.TotalSeconds,
+            }),
+        });
+
+    /// <summary>
     /// Reads the token and picks the gateway of the title it is for, answering
     /// the request itself when there is nothing to hand it to. The title is
     /// chosen by the audience the token claims; the gateway then verifies the

@@ -10,7 +10,7 @@ public class ServerCommandVerifierTests
     private readonly PlayforwardTokenFactory _factory = new();
 
     private ServerCommandVerifier NewVerifier(string? audience = null) => new(
-        _factory.PublicKey,
+        new PinnedSigningKey(_factory.PublicKey),
         PlayforwardTokenFactory.Issuer,
         audience ?? PlayforwardTokenFactory.Audience,
         TimeSpan.FromSeconds(30));

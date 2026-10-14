@@ -166,4 +166,100 @@ public sealed class LaunchStoreTests
         Assert.NotEqual(first.Key, second.Key);
         Assert.Equal(32, first.Key.Length);
     }
+
+    // -----------------------------------------------------------------
+    // KEEP: a proved game says it is still running
+    // -----------------------------------------------------------------
+
+    /// <summary>Issues a launch and proves it from <see cref="Game"/>, as a shim would.</summary>
+    private static IssuedLaunch IssueAndProve(LaunchStore store, ResolvedPlayer? player = null)
+    {
+        IssuedLaunch launch = store.Issue(player ?? NewPlayer());
+        Assert.NotNull(store.Prove(launch.IdBytes, Game, Answer(launch, store.Challenge(launch.IdBytes, Game)!)));
+        return launch;
+    }
+
+    private static (ResolvedPlayer Player, byte[] Alive)? Keep(LaunchStore store, IssuedLaunch launch, IPEndPoint from, ulong counter) =>
+        KeepDatagram(store, launch, from, LaunchEnvelope.Keep(launch.Key, launch.IdBytes, counter));
+
+    private static (ResolvedPlayer Player, byte[] Alive)? KeepDatagram(LaunchStore store, IssuedLaunch launch, IPEndPoint from, byte[] datagram)
+    {
+        Assert.True(LaunchEnvelope.TryParse(datagram, out LaunchEnvelope.Message message));
+        Assert.Equal(LaunchEnvelope.Kind.Keep, message.Kind);
+        return store.Keep(launch.IdBytes, from, message.Body);
+    }
+
+    [Fact]
+    public void AKeepFromTheProvedSocketIsAnsweredWithAnAuthenticatedAlive()
+    {
+        var store = NewStore();
+        IssuedLaunch launch = IssueAndProve(store);
+
+        var kept = Keep(store, launch, Game, counter: 1);
+
+        Assert.NotNull(kept);
+        // The shim checks ALIVE with the key: it is this server, answering this KEEP.
+        Assert.True(LaunchEnvelope.TryReadReply(kept.Value.Alive, LaunchEnvelope.Kind.Alive, launch.IdBytes, out byte[] body));
+        Assert.True(LaunchEnvelope.TryReadReply(LaunchEnvelope.Alive(launch.Key, launch.IdBytes, 1), LaunchEnvelope.Kind.Alive, launch.IdBytes, out byte[] expected));
+        Assert.Equal(expected, body);
+    }
+
+    [Fact]
+    public void AKeepBeforeAnyProofIsRefused()
+    {
+        var store = NewStore();
+        IssuedLaunch launch = store.Issue(NewPlayer());
+
+        // Holding the key is not enough: a launch is kept only from the socket it was proved on.
+        Assert.Null(Keep(store, launch, Game, counter: 1));
+    }
+
+    [Fact]
+    public void AKeepFromAnotherSocketIsRefused()
+    {
+        var store = NewStore();
+        IssuedLaunch launch = IssueAndProve(store);
+
+        // Sent from elsewhere it would keep a binding alive for a game that is gone.
+        Assert.Null(Keep(store, launch, Eavesdropper, counter: 1));
+        Assert.NotNull(Keep(store, launch, Game, counter: 1));
+    }
+
+    [Fact]
+    public void AKeepReadOffTheWireCannotBeSentAgain()
+    {
+        var store = NewStore();
+        IssuedLaunch launch = IssueAndProve(store);
+        byte[] keep = LaunchEnvelope.Keep(launch.Key, launch.IdBytes, 5);
+
+        Assert.NotNull(KeepDatagram(store, launch, Game, keep));
+        Assert.Null(KeepDatagram(store, launch, Game, keep));
+        Assert.Null(Keep(store, launch, Game, counter: 4));
+        Assert.NotNull(Keep(store, launch, Game, counter: 6));
+    }
+
+    [Fact]
+    public void AKeepWithoutTheLaunchKeyIsRefused()
+    {
+        var store = NewStore();
+        IssuedLaunch launch = IssueAndProve(store);
+        byte[] forged = LaunchEnvelope.Keep(RandomNumberGenerator.GetBytes(32), launch.IdBytes, 1);
+
+        Assert.Null(KeepDatagram(store, launch, Game, forged));
+        // And it spent nothing: the counter it named is still free for the real shim.
+        Assert.NotNull(Keep(store, launch, Game, counter: 1));
+    }
+
+    [Fact]
+    public void ARenewedLaunchProvedOnTheSameSocketRetiresTheOldOne()
+    {
+        var store = NewStore();
+        ResolvedPlayer player = NewPlayer();
+        IssuedLaunch old = IssueAndProve(store, player);
+        IssuedLaunch renewed = IssueAndProve(store, player);
+
+        Assert.Null(Keep(store, old, Game, counter: 1));
+        Assert.Null(store.Challenge(old.IdBytes, Game));
+        Assert.NotNull(Keep(store, renewed, Game, counter: 1));
+    }
 }

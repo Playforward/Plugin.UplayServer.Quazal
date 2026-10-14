@@ -539,8 +539,8 @@ internal sealed partial class QuazalResponder : IDisposable
         }
         else
         {
-            Log.Warning("[quazal] DATA seq={Sequence} from {Source} has unsupported encoding {Compression}: {Clear}",
-                request.SequenceId, source, compression, Convert.ToHexString(clear));
+            Log.Warning("[quazal] DATA seq={Sequence} from {Source} has unsupported encoding {Compression} ({Length} bytes, starting {Header})",
+                request.SequenceId, source, compression, clear.Length, HeaderForLog(clear));
             return null;
         }
 
@@ -562,8 +562,8 @@ internal sealed partial class QuazalResponder : IDisposable
 
         if (!RmcRequest.TryParse(rmcBytes, out RmcRequest rmc))
         {
-            Log.Warning("[quazal] DATA seq={Sequence} from {Source} did not decode as RMC ({Length} bytes): {Clear}",
-                request.SequenceId, source, rmcBytes.Length, Convert.ToHexString(rmcBytes));
+            Log.Warning("[quazal] DATA seq={Sequence} from {Source} did not decode as RMC ({Length} bytes, starting {Header})",
+                request.SequenceId, source, rmcBytes.Length, HeaderForLog(rmcBytes));
             return null;
         }
 
@@ -605,7 +605,7 @@ internal sealed partial class QuazalResponder : IDisposable
             Log.Warning("[quazal] protocol={Protocol} method={Method} not implemented for {Title} ({Reason}); parameters={Parameters} — replying Core::NotImplemented",
                 rmc.ServiceId, rmc.MethodId, peer.Title,
                 handled ? "the handler declined" : "no handler registered",
-                Convert.ToHexString(rmc.Parameters));
+                ParametersForLog(rmc));
             response = TicketGranting.BuildRmcErrorResponse(
                 rmc.ProtocolId, rmc.CallId, CoreNotImplemented, rmc.ExtendedProtocolId);
         }
@@ -683,6 +683,16 @@ internal sealed partial class QuazalResponder : IDisposable
         return SecureConnection.BuildRegisterResult(connectionId, publicUrl);
     }
 
+    private const int RmcHeaderBytes = 13;
+
+    internal static string ParametersForLog(RmcRequest rmc) =>
+        rmc.ServiceId == TicketGranting.ProtocolId
+            ? $"<{rmc.Parameters.Length} bytes withheld: authentication>"
+            : Convert.ToHexString(rmc.Parameters);
+
+    internal static string HeaderForLog(ReadOnlySpan<byte> message) =>
+        Convert.ToHexString(message[..Math.Min(RmcHeaderBytes, message.Length)]);
+
     /// <summary>
     /// Ticket Granting Login. The account name selects a server-configured
     /// password and PID used to seal the returned ticket. FC3's LoginEx path
@@ -723,11 +733,9 @@ internal sealed partial class QuazalResponder : IDisposable
                 ? BinaryPrimitives.ReadUInt16LittleEndian(rmc.Parameters)
                 : 0;
             int authOffset = 2 + usernameLength;
-            string authData = authOffset >= 2 && authOffset <= rmc.Parameters.Length
-                ? Convert.ToHexString(rmc.Parameters.AsSpan(authOffset))
-                : "<malformed>";
-            Log.Information("[quazal] LoginEx auth holder: total={TotalLength} offset={Offset} data={AuthData}",
-                rmc.Parameters.Length, authOffset, authData);
+            int authLength = authOffset <= rmc.Parameters.Length ? rmc.Parameters.Length - authOffset : 0;
+            Log.Information("[quazal] LoginEx auth holder: total={TotalLength} offset={Offset} length={AuthLength}",
+                rmc.Parameters.Length, authOffset, authLength);
         }
         uint serverPid = isPlayerLogin
             ? TicketGranting.PlayerSecureServerPid

@@ -50,14 +50,14 @@ internal sealed record ServerCommand(
 /// </summary>
 internal sealed class ServerCommandVerifier
 {
-    private readonly Ed25519PublicKeyParameters _publicKey;
+    private readonly SigningKeys _keys;
     private readonly string _issuer;
     private readonly string _audience;
     private readonly TimeSpan _clockSkew;
 
-    public ServerCommandVerifier(Ed25519PublicKeyParameters publicKey, string issuer, string audience, TimeSpan clockSkew)
+    public ServerCommandVerifier(SigningKeys keys, string issuer, string audience, TimeSpan clockSkew)
     {
-        _publicKey = publicKey;
+        _keys = keys;
         _issuer = issuer;
         _audience = audience;
         _clockSkew = clockSkew;
@@ -68,7 +68,7 @@ internal sealed class ServerCommandVerifier
     /// </summary>
     public ServerCommand? Verify(string token)
     {
-        SignedJwt? jwt = SignedJwt.Verify(token, _publicKey, "command");
+        SignedJwt? jwt = SignedJwt.Verify(token, _keys, "command");
         if (jwt is null || !jwt.HasValidEnvelope(_issuer, _audience, _clockSkew, "command"))
             return null;
 

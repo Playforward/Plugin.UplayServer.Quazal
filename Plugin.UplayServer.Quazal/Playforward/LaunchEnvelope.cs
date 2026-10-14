@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -37,12 +38,20 @@ internal static class LaunchEnvelope
     /// <summary>HMAC-SHA256 output.</summary>
     public const int MacLength = HMACSHA256.HashSizeInBytes;
 
+    /// <summary>
+    /// A KEEP's counter: a u64, little-endian, that only ever rises within a
+    /// launch, so a KEEP read off the wire and sent again is refused.
+    /// </summary>
+    public const int CounterLength = sizeof(ulong);
+
     private const int HeaderLength = LaunchIdOffset + LaunchIdLength;
     private const int BodyOffset = HeaderLength;
 
     /// <summary>Domain separation, so a proof can never be mistaken for a bound reply or anything else keyed the same way.</summary>
     private static readonly byte[] ProofPrefix = Encoding.ASCII.GetBytes("playforward-launch-proof");
     private static readonly byte[] BoundPrefix = Encoding.ASCII.GetBytes("playforward-launch-bound");
+    private static readonly byte[] KeepPrefix = Encoding.ASCII.GetBytes("playforward-launch-keep");
+    private static readonly byte[] AlivePrefix = Encoding.ASCII.GetBytes("playforward-launch-alive");
 
     public enum Kind : byte
     {
@@ -50,10 +59,12 @@ internal static class LaunchEnvelope
         Challenge = 2,
         Proof = 3,
         Bound = 4,
+        Keep = 5,
+        Alive = 6,
     }
 
     /// <summary>A parsed inbound message: what it is, which launch it names, and its body.</summary>
-    /// <param name="Body">Empty for HELLO; the proof for PROOF.</param>
+    /// <param name="Body">Empty for HELLO; the proof for PROOF; the counter and its MAC for KEEP.</param>
     public readonly record struct Message(Kind Kind, byte[] LaunchId, byte[] Body);
 
     /// <summary>
@@ -77,6 +88,7 @@ internal static class LaunchEnvelope
         {
             Kind.Hello => 0,
             Kind.Proof => MacLength,
+            Kind.Keep => CounterLength + MacLength,
             _ => -1,
         };
         if (bodyLength < 0 || datagram.Length != HeaderLength + bodyLength)
@@ -112,6 +124,39 @@ internal static class LaunchEnvelope
     public static byte[] Proof(ReadOnlySpan<byte> key, ReadOnlySpan<byte> launchId, ReadOnlySpan<byte> challenge) =>
         Build(Kind.Proof, launchId, ExpectedProof(key, launchId, challenge));
 
+    /// <summary>What a KEEP carrying <paramref name="counter"/> must be authenticated with.</summary>
+    public static byte[] ExpectedKeep(ReadOnlySpan<byte> key, ReadOnlySpan<byte> launchId, ulong counter) =>
+        Mac(key, KeepPrefix, launchId, CounterBytes(counter));
+
+    /// <summary>The KEEP a shim sends. Same reason as <see cref="Hello"/>.</summary>
+    public static byte[] Keep(ReadOnlySpan<byte> key, ReadOnlySpan<byte> launchId, ulong counter) =>
+        Build(Kind.Keep, launchId, [.. CounterBytes(counter), .. ExpectedKeep(key, launchId, counter)]);
+
+    /// <summary>
+    /// Splits a KEEP's body into its counter and its MAC. The length was
+    /// checked by <see cref="TryParse"/>.
+    /// </summary>
+    public static (ulong Counter, byte[] Mac) ReadKeep(ReadOnlySpan<byte> body) =>
+        (BinaryPrimitives.ReadUInt64LittleEndian(body), body[CounterLength..].ToArray());
+
+    /// <summary>
+    /// The ALIVE answer to a KEEP: its counter again, authenticated, so the
+    /// shim knows this server still holds the launch and answered this KEEP
+    /// rather than an old one.
+    /// </summary>
+    public static byte[] Alive(ReadOnlySpan<byte> key, ReadOnlySpan<byte> launchId, ulong counter)
+    {
+        byte[] counterBytes = CounterBytes(counter);
+        return Build(Kind.Alive, launchId, [.. counterBytes, .. Mac(key, AlivePrefix, launchId, counterBytes)]);
+    }
+
+    private static byte[] CounterBytes(ulong counter)
+    {
+        byte[] bytes = new byte[CounterLength];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, counter);
+        return bytes;
+    }
+
     /// <summary>Reads the body of an outbound CHALLENGE or BOUND, for a client that receives one.</summary>
     public static bool TryReadReply(ReadOnlySpan<byte> datagram, Kind expected, ReadOnlySpan<byte> launchId, out byte[] body)
     {
@@ -120,6 +165,7 @@ internal static class LaunchEnvelope
         {
             Kind.Challenge => ChallengeLength,
             Kind.Bound => MacLength,
+            Kind.Alive => CounterLength + MacLength,
             _ => -1,
         };
         if (bodyLength < 0 || datagram.Length != HeaderLength + bodyLength ||

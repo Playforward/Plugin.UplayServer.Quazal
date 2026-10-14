@@ -23,12 +23,12 @@ internal sealed class SignedJwt
     /// reason. Nothing about the claims is checked here.
     /// </summary>
     /// <param name="token">The compact-serialised JWT.</param>
-    /// <param name="publicKey">Playforward's Ed25519 public key.</param>
+    /// <param name="keys">Playforward's Ed25519 public keys, of which the header's <c>kid</c> picks one.</param>
     /// <param name="what">
     /// What is being verified, for the log line. A refusal is worth being able
     /// to attribute to a login or to a command without reading the code.
     /// </param>
-    public static SignedJwt? Verify(string token, Ed25519PublicKeyParameters publicKey, string what)
+    public static SignedJwt? Verify(string token, SigningKeys keys, string what)
     {
         if (string.IsNullOrWhiteSpace(token))
             return null;
@@ -60,13 +60,16 @@ internal sealed class SignedJwt
             return null;
         }
 
+        if (keys.ForKeyId(ReadString(header, "kid")) is not { } publicKey)
+            return null;
+
         byte[] signedContent = Encoding.ASCII.GetBytes(parts[0] + "." + parts[1]);
         var verifier = new Ed25519Signer();
         verifier.Init(forSigning: false, publicKey);
         verifier.BlockUpdate(signedContent, 0, signedContent.Length);
         if (!verifier.VerifySignature(signature))
         {
-            Log.Warning("[playforward] rejected a {What} whose signature does not verify against the configured key", what);
+            Log.Warning("[playforward] rejected a {What} whose signature does not verify against Playforward's key", what);
             return null;
         }
 

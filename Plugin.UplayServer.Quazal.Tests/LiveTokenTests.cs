@@ -52,7 +52,7 @@ public class LiveTokenTests
 
         byte[] raw = SignedJwt.Base64UrlDecode(key!.Trim());
         var verifier = new ServerCommandVerifier(
-            new Org.BouncyCastle.Crypto.Parameters.Ed25519PublicKeyParameters(raw),
+            new PinnedSigningKey(new Org.BouncyCastle.Crypto.Parameters.Ed25519PublicKeyParameters(raw)),
             Environment.GetEnvironmentVariable("PLAYFORWARD_TEST_ISSUER") ?? PlayforwardTokenFactory.Issuer,
             Environment.GetEnvironmentVariable("PLAYFORWARD_TEST_AUDIENCE") ?? PlayforwardTokenFactory.Audience,
             // A command lives about two minutes; a human running this by hand

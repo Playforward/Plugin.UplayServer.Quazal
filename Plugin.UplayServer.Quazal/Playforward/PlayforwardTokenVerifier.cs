@@ -1,5 +1,3 @@
-using Org.BouncyCastle.Crypto.Parameters;
-
 namespace Plugin.UplayServer.Quazal.Playforward;
 
 /// <summary>
@@ -8,24 +6,29 @@ namespace Plugin.UplayServer.Quazal.Playforward;
 /// </summary>
 internal sealed class PlayforwardTokenVerifier
 {
-    private readonly Ed25519PublicKeyParameters _publicKey;
     private readonly string _issuer;
     private readonly string _audience;
     private readonly TimeSpan _clockSkew;
 
-    private PlayforwardTokenVerifier(Ed25519PublicKeyParameters publicKey, string issuer, string audience, TimeSpan clockSkew)
+    private PlayforwardTokenVerifier(SigningKeys keys, string issuer, string audience, TimeSpan clockSkew)
     {
-        _publicKey = publicKey;
+        Keys = keys;
         _issuer = issuer;
         _audience = audience;
         _clockSkew = clockSkew;
     }
 
     /// <summary>
-    /// The key this verifier holds, so the command verifier shares it rather
-    /// than decoding the configured value a second time.
+    /// The keys this verifier checks with, so the command verifier shares them
+    /// (and their JWKS) rather than fetching a second copy.
     /// </summary>
-    public Ed25519PublicKeyParameters PublicKey => _publicKey;
+    public SigningKeys Keys { get; }
+
+    /// <summary>The <c>aud</c> a token must carry here.</summary>
+    public string Audience => _audience;
+
+    /// <summary>How far this server's clock and Playforward's may disagree.</summary>
+    public TimeSpan ClockSkew => _clockSkew;
 
     /// <summary>
     /// Builds a verifier from configuration, or returns null with a logged
@@ -38,41 +41,26 @@ internal sealed class PlayforwardTokenVerifier
     /// accepted another title's audience would let that title's server replay
     /// its players' tokens here.
     /// </param>
-    public static PlayforwardTokenVerifier? Create(PlayforwardSettings settings, string audience)
+    /// <param name="keys">The keys to verify with; built from <paramref name="settings"/> when null (a test supplies its own).</param>
+    /// <param name="time">The clock a JWKS refresh is paced by; the system's unless a test supplies one.</param>
+    public static PlayforwardTokenVerifier? Create(PlayforwardSettings settings, string audience,
+        SigningKeys? keys = null, TimeProvider? time = null)
     {
         if (!settings.Enabled)
             return null;
 
-        if (string.IsNullOrWhiteSpace(settings.PublicKeyBase64))
-        {
-            Log.Error("[playforward] enabled but PublicKeyBase64 is empty: no token can be verified");
-            return null;
-        }
         if (string.IsNullOrWhiteSpace(settings.Issuer) || string.IsNullOrWhiteSpace(audience))
         {
             Log.Error("[playforward] Issuer and the title's audience are both required: an unchecked audience is the same as no separation between titles");
             return null;
         }
 
-        try
-        {
-            byte[] raw = SignedJwt.Base64UrlDecode(settings.PublicKeyBase64.Trim());
-            if (raw.Length != Ed25519PublicKeyParameters.KeySize)
-            {
-                Log.Error("[playforward] PublicKeyBase64 is {Length} bytes, expected {Expected}: this must be the raw key from the JWKS \"x\" value, not a PEM or a DER wrapper",
-                    raw.Length, Ed25519PublicKeyParameters.KeySize);
-                return null;
-            }
-
-            var key = new Ed25519PublicKeyParameters(raw);
-            Log.Information("[playforward] token verification enabled: issuer={Issuer} audience={Audience}", settings.Issuer, audience);
-            return new PlayforwardTokenVerifier(key, settings.Issuer, audience, TimeSpan.FromSeconds(settings.ClockSkewSeconds));
-        }
-        catch (FormatException exception)
-        {
-            Log.Error("[playforward] PublicKey is not valid base64 or base64url: {Error}", exception.Message);
+        keys ??= SigningKeys.FromSettings(settings, time ?? TimeProvider.System);
+        if (keys is null)
             return null;
-        }
+
+        Log.Information("[playforward] token verification enabled: issuer={Issuer} audience={Audience}", settings.Issuer, audience);
+        return new PlayforwardTokenVerifier(keys, settings.Issuer, audience, TimeSpan.FromSeconds(settings.ClockSkewSeconds));
     }
 
     /// <summary>
@@ -81,7 +69,7 @@ internal sealed class PlayforwardTokenVerifier
     /// </summary>
     public PlayforwardIdentity? Verify(string token)
     {
-        SignedJwt? jwt = SignedJwt.Verify(token, _publicKey, "token");
+        SignedJwt? jwt = SignedJwt.Verify(token, Keys, "token");
         if (jwt is null || !jwt.HasValidEnvelope(_issuer, _audience, _clockSkew, "token"))
             return null;
 

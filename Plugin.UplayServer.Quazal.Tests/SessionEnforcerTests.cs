@@ -11,7 +11,7 @@ public class SessionEnforcerTests
     private readonly PlayforwardTokenFactory _factory = new();
 
     private ServerCommandVerifier NewVerifier() => new(
-        _factory.PublicKey,
+        new PinnedSigningKey(_factory.PublicKey),
         PlayforwardTokenFactory.Issuer,
         PlayforwardTokenFactory.Audience,
         TimeSpan.FromSeconds(30));

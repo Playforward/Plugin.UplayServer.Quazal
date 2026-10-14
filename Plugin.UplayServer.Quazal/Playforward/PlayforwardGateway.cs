@@ -454,9 +454,34 @@ internal sealed class PlayforwardGateway : IDisposable
                     string.IsNullOrEmpty(player.Identity.PartyRef) ? "none" : player.Identity.PartyRef);
                 return bound;
 
+            case LaunchEnvelope.Kind.Keep:
+                if (_launches.Keep(message.LaunchId, source, message.Body) is not var (kept, alive))
+                    return null;
+                KeepSocketBinding(source, kept);
+                return alive;
+
             default:
                 return null;
         }
+    }
+
+    /// <summary>
+    /// Keeps a proved socket's binding alive on a KEEP, and restores it if it
+    /// lapsed while the game had nothing else to say 
+    /// </summary>
+    private void KeepSocketBinding(IPEndPoint socket, ResolvedPlayer player)
+    {
+        if (_bindings.TryGetValue(EndpointKey(socket), out Binding? binding) &&
+            string.Equals(binding.Player.Identity.AccountId, player.Identity.AccountId, StringComparison.Ordinal) &&
+            !binding.LastActive.IdleLongerThan(_bindingIdleTimeout, _time.GetUtcNow()))
+        {
+            binding.LastActive.Touch(_time.GetUtcNow());
+            return;
+        }
+
+        BindSocket(socket, player);
+        Log.Information("[playforward] {DisplayName} ({AccountId}) kept their launch from {Source}; re-bound as pid={Pid}",
+            player.Identity.DisplayName, player.Identity.AccountId, socket, player.Pid);
     }
 
     /// <summary>

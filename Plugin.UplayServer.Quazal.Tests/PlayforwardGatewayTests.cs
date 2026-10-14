@@ -751,6 +751,120 @@ public sealed class PlayforwardGatewayTests : IDisposable
         Assert.False(ProveLaunch(gateway, launch, new System.Net.IPEndPoint(GameSocket.Address, 51009)));
     }
 
+    // -----------------------------------------------------------------
+    // A long session: KEEP holds the binding, renewal outlives the ceiling
+    // -----------------------------------------------------------------
+
+    /// <summary>How often the shim sends a KEEP (docs/planned/shim-launch-over-tls.md).</summary>
+    private static readonly TimeSpan KeepInterval = TimeSpan.FromSeconds(60);
+
+    /// <summary>Sends one KEEP from <paramref name="socket"/> and returns whether an authenticated ALIVE came back.</summary>
+    private static bool Keep(PlayforwardGateway gateway, IssuedLaunch launch, System.Net.IPEndPoint socket, ulong counter)
+    {
+        byte[]? alive = gateway.HandleLaunchDatagram(LaunchEnvelope.Keep(launch.Key, launch.IdBytes, counter), socket, out bool recognised);
+        Assert.True(recognised);
+        return alive is not null &&
+               LaunchEnvelope.TryReadReply(alive, LaunchEnvelope.Kind.Alive, launch.IdBytes, out byte[] body) &&
+               LaunchEnvelope.TryReadReply(LaunchEnvelope.Alive(launch.Key, launch.IdBytes, counter), LaunchEnvelope.Kind.Alive, launch.IdBytes, out byte[] expected) &&
+               body.AsSpan().SequenceEqual(expected);
+    }
+
+    [Fact]
+    public void AnHourOfSinglePlayerKeepsItsBindingOnKeepsAlone()
+    {
+        // The game sends this server nothing while the player is in the
+        // campaign, so the socket binding used to end after three minutes and
+        // the next online login was nobody.
+        var time = new FakeTimeProvider();
+        using PlayforwardGateway gateway = NewGateway(time);
+        IssuedLaunch launch = gateway.PreLaunch(_tokens.Mint(AccountId))!;
+        Assert.True(ProveLaunch(gateway, launch, GameSocket));
+
+        for (ulong counter = 1; counter <= 60; counter++)
+        {
+            time.Advance(KeepInterval);
+            gateway.KeepAlive(NoSockets, NoPlayers);
+            Assert.True(Keep(gateway, launch, GameSocket, counter));
+            Assert.NotNull(gateway.ForEndpoint(GameSocket));
+        }
+    }
+
+    [Fact]
+    public void AKeepRestoresABindingThatLapsed()
+    {
+        // A laptop asleep, a network that dropped for a few minutes: the
+        // binding ended, but the launch is still good and only its game can
+        // send a KEEP for it.
+        var time = new FakeTimeProvider();
+        using PlayforwardGateway gateway = NewGateway(time);
+        IssuedLaunch launch = gateway.PreLaunch(_tokens.Mint(AccountId))!;
+        Assert.True(ProveLaunch(gateway, launch, GameSocket));
+
+        time.Advance(BindingIdle + OneSecond);
+        gateway.KeepAlive(NoSockets, NoPlayers);
+        Assert.Null(gateway.ForEndpoint(GameSocket));
+
+        Assert.True(Keep(gateway, launch, GameSocket, counter: 1));
+        Assert.Equal(AccountId, gateway.ForEndpoint(GameSocket)!.Identity.AccountId);
+    }
+
+    [Fact]
+    public void ADayLongSessionStaysBoundAcrossItsRenewals()
+    {
+        // Eight hours is a launch's ceiling. The shim renews at three
+        // quarters of it -- a new token, a new launch, a new proof on the
+        // same socket -- and keeps the new one from then on.
+        var time = new FakeTimeProvider();
+        using PlayforwardGateway gateway = NewGateway(time);
+        IssuedLaunch launch = gateway.PreLaunch(_tokens.Mint(AccountId))!;
+        Assert.True(ProveLaunch(gateway, launch, GameSocket));
+        TimeSpan renewAfter = (launch.ExpiresAt - time.GetUtcNow()) * 3 / 4;
+        DateTimeOffset renewAt = time.GetUtcNow() + renewAfter;
+        TimeSpan session = TimeSpan.FromHours(24);
+        DateTimeOffset end = time.GetUtcNow() + session;
+        ulong counter = 0;
+        int renewals = 0;
+
+        while (time.GetUtcNow() < end)
+        {
+            time.Advance(KeepInterval);
+            gateway.KeepAlive(NoSockets, NoPlayers);
+            if (time.GetUtcNow() >= renewAt)
+            {
+                IssuedLaunch renewed = gateway.PreLaunch(_tokens.Mint(AccountId))!;
+                Assert.True(ProveLaunch(gateway, renewed, GameSocket));
+                // The launch it replaced is gone: one socket, one launch.
+                Assert.False(Keep(gateway, launch, GameSocket, counter + 1));
+                launch = renewed;
+                counter = 0;
+                renewAt = time.GetUtcNow() + renewAfter;
+                renewals++;
+            }
+            Assert.True(Keep(gateway, launch, GameSocket, ++counter));
+            Assert.Equal(AccountId, gateway.ForEndpoint(GameSocket)!.Identity.AccountId);
+        }
+
+        // Every six hours, the last landing on the day's final minute.
+        Assert.Equal((int)(session / renewAfter), renewals);
+    }
+
+    [Fact]
+    public void AServerThatRestartedAnswersNoKeep()
+    {
+        // Launches live in memory. The shim learns of a restart from its KEEPs
+        // going unanswered, and acquires a fresh launch.
+        IssuedLaunch launch;
+        using (PlayforwardGateway before = NewGateway())
+        {
+            launch = before.PreLaunch(_tokens.Mint(AccountId))!;
+            Assert.True(ProveLaunch(before, launch, GameSocket));
+            Assert.True(Keep(before, launch, GameSocket, counter: 1));
+        }
+
+        using PlayforwardGateway after = NewGateway();
+        Assert.False(Keep(after, launch, GameSocket, counter: 2));
+    }
+
     [Fact]
     public void IsNotRunningWhenDisabled()
     {

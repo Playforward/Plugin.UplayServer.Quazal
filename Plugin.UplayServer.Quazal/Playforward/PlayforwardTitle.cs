@@ -28,8 +28,14 @@ internal sealed class PlayforwardTitle : IDisposable
     public string ServerLabel =>
         string.IsNullOrWhiteSpace(Settings.ServerLabel) ? Title.Name : Settings.ServerLabel;
 
+    /// <summary>
+    /// The registration this title's tokens are minted for, as Playforward's
+    /// directory lists it. Null only for a test's stand-in.
+    /// </summary>
+    public Guid? ServerId { get; }
+
     private PlayforwardTitle(QuazalTitle title, string audience, PlayforwardTitleSettings settings,
-        PlayforwardServerClient? client, IProgressStore store, PlayforwardGateway gateway)
+        PlayforwardServerClient? client, IProgressStore store, PlayforwardGateway gateway, Guid? serverId)
     {
         Title = title;
         Audience = audience;
@@ -37,13 +43,15 @@ internal sealed class PlayforwardTitle : IDisposable
         Client = client;
         Store = store;
         Gateway = gateway;
+        ServerId = serverId;
     }
 
     /// <summary>
-    /// A title over a gateway and store a test built itself 
+    /// A title over a gateway and store a test built itself
     /// </summary>
-    internal static PlayforwardTitle ForTests(QuazalTitle title, string audience, PlayforwardGateway gateway, IProgressStore store) =>
-        new(title, audience, title.Settings.Playforward ?? new(), client: null, store, gateway);
+    internal static PlayforwardTitle ForTests(QuazalTitle title, string audience, PlayforwardGateway gateway, IProgressStore store,
+        Guid? serverId = null) =>
+        new(title, audience, title.Settings.Playforward ?? new(), client: null, store, gateway, serverId);
 
     /// <summary>
     /// Brings one title's Playforward half up, or returns null with the
@@ -101,7 +109,7 @@ internal sealed class PlayforwardTitle : IDisposable
         }
         gateway.AttachClient(client);
 
-        return new PlayforwardTitle(title, audience, settings, client, store, gateway);
+        return new PlayforwardTitle(title, audience, settings, client, store, gateway, serverId);
     }
 
     /// <summary>
@@ -137,7 +145,7 @@ internal sealed class PlayforwardTitle : IDisposable
         }
 
         var commands = new ServerCommandVerifier(
-            Gateway.Verifier.PublicKey,
+            Gateway.Verifier.Keys,
             global.Issuer,
             Audience,
             TimeSpan.FromSeconds(global.ClockSkewSeconds));
