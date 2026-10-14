@@ -29,7 +29,9 @@ internal sealed class HarnessTokenSource
 
     public string PublicKeyBase64Url { get; }
 
-    public string Mint(string accountId, string audience, string issuer, string displayName = "Harness Player", string legacyName = "harness-player", string retroName = "harness")
+    /// <param name="tokenId">The jti; a fresh one unless the caller needs to know it (a renewal's proof covers it).</param>
+    public string Mint(string accountId, string audience, string issuer, string displayName = "Harness Player", string legacyName = "harness-player", string retroName = "harness",
+        string? tokenId = null)
     {
         var now = DateTimeOffset.UtcNow;
         string header = JsonSerializer.Serialize(new { alg = "EdDSA", kid = "harness" });
@@ -43,7 +45,7 @@ internal sealed class HarnessTokenSource
             sub = accountId,
             iss = issuer,
             aud = new[] { audience },
-            jti = Guid.NewGuid().ToString(),
+            jti = tokenId ?? Guid.NewGuid().ToString(),
             iat = now.ToUnixTimeSeconds(),
             nbf = now.ToUnixTimeSeconds(),
             exp = now.AddMinutes(1).ToUnixTimeSeconds(),

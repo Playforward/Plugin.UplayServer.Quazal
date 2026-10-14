@@ -101,4 +101,34 @@ public sealed class LaunchEnvelopeTests
     {
         Assert.Throws<ArgumentException>(() => LaunchEnvelope.Hello(new byte[LaunchEnvelope.LaunchIdLength - 1]));
     }
+
+    // Fixed vectors, computed with Python's hmac module rather than either
+    // implementation, and pinned in UplaySDKShim's tests/launch_envelope_test.cpp
+    // too: the shim and this server must agree on these bytes exactly.
+    private static readonly byte[] VectorKey = Enumerable.Range(0, 32).Select(i => (byte)i).ToArray();
+    private static readonly byte[] VectorId = Convert.FromHexString("00112233445566778899aabbccddeeff");
+
+    [Fact]
+    public void AKeepIsTheVectorBothSidesPin()
+    {
+        Assert.Equal(
+            "50465744010500112233445566778899aabbccddeeff070000000000000070b7ce52f20fadd21f1ed4bee448df4869832050936706d39497fd28a2687e5c",
+            Convert.ToHexString(LaunchEnvelope.Keep(VectorKey, VectorId, counter: 7)).ToLowerInvariant());
+    }
+
+    [Fact]
+    public void ARenewalProofIsTheVectorBothSidesPin()
+    {
+        Assert.Equal(
+            "4ba3d6c3436ccffdd30becf902151dbf5926babe8e177ca3ce9ced96272471ed",
+            Convert.ToHexString(LaunchEnvelope.ExpectedRenewal(VectorKey, VectorId, "4b9c2d1e-0000-4000-8000-00000000abcd")).ToLowerInvariant());
+    }
+
+    [Fact]
+    public void ACheckProofIsTheVectorBothSidesPin()
+    {
+        Assert.Equal(
+            "edce1a06343a503caa67d1602e698bff3eb0b9610cf18b1823833b992cb58ab5",
+            Convert.ToHexString(LaunchEnvelope.ExpectedCheck(VectorKey, VectorId)).ToLowerInvariant());
+    }
 }

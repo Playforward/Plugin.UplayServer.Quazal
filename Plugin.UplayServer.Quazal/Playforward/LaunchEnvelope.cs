@@ -51,7 +51,8 @@ internal static class LaunchEnvelope
     private static readonly byte[] ProofPrefix = Encoding.ASCII.GetBytes("playforward-launch-proof");
     private static readonly byte[] BoundPrefix = Encoding.ASCII.GetBytes("playforward-launch-bound");
     private static readonly byte[] KeepPrefix = Encoding.ASCII.GetBytes("playforward-launch-keep");
-    private static readonly byte[] AlivePrefix = Encoding.ASCII.GetBytes("playforward-launch-alive");
+    private static readonly byte[] RenewPrefix = Encoding.ASCII.GetBytes("playforward-launch-renew");
+    private static readonly byte[] CheckPrefix = Encoding.ASCII.GetBytes("playforward-launch-check");
 
     public enum Kind : byte
     {
@@ -60,7 +61,6 @@ internal static class LaunchEnvelope
         Proof = 3,
         Bound = 4,
         Keep = 5,
-        Alive = 6,
     }
 
     /// <summary>A parsed inbound message: what it is, which launch it names, and its body.</summary>
@@ -140,15 +140,24 @@ internal static class LaunchEnvelope
         (BinaryPrimitives.ReadUInt64LittleEndian(body), body[CounterLength..].ToArray());
 
     /// <summary>
-    /// The ALIVE answer to a KEEP: its counter again, authenticated, so the
-    /// shim knows this server still holds the launch and answered this KEEP
-    /// rather than an old one.
+    /// What a renewal of <paramref name="launchId"/> must carry: a MAC under the
+    /// launch's key over the id and the new token's <c>jti</c>. The token is
+    /// spent by the renewal, so the MAC is good once, and only the shim holding
+    /// the old key can move its socket's binding to a new launch.
     /// </summary>
-    public static byte[] Alive(ReadOnlySpan<byte> key, ReadOnlySpan<byte> launchId, ulong counter)
-    {
-        byte[] counterBytes = CounterBytes(counter);
-        return Build(Kind.Alive, launchId, [.. counterBytes, .. Mac(key, AlivePrefix, launchId, counterBytes)]);
-    }
+    public static byte[] ExpectedRenewal(ReadOnlySpan<byte> key, ReadOnlySpan<byte> launchId, string tokenId) =>
+        Mac(key, RenewPrefix, launchId, Encoding.UTF8.GetBytes(tokenId));
+
+    /// <summary>
+    /// What asking whether this server still holds <paramref name="launchId"/>
+    /// must carry: a MAC under the launch's key over its id. Nothing varies, so
+    /// it is the same on every ask; that is enough for a question that changes
+    /// nothing and is answered with one bit, over the shim's HTTPS connection.
+    /// It is there so the answer goes only to whoever holds the key, not to
+    /// anyone who read the id off a KEEP.
+    /// </summary>
+    public static byte[] ExpectedCheck(ReadOnlySpan<byte> key, ReadOnlySpan<byte> launchId) =>
+        Mac(key, CheckPrefix, launchId, ReadOnlySpan<byte>.Empty);
 
     private static byte[] CounterBytes(ulong counter)
     {
@@ -165,7 +174,6 @@ internal static class LaunchEnvelope
         {
             Kind.Challenge => ChallengeLength,
             Kind.Bound => MacLength,
-            Kind.Alive => CounterLength + MacLength,
             _ => -1,
         };
         if (bodyLength < 0 || datagram.Length != HeaderLength + bodyLength ||

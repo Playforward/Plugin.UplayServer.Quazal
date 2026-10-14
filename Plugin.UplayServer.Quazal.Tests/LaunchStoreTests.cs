@@ -179,10 +179,10 @@ public sealed class LaunchStoreTests
         return launch;
     }
 
-    private static (ResolvedPlayer Player, byte[] Alive)? Keep(LaunchStore store, IssuedLaunch launch, IPEndPoint from, ulong counter) =>
+    private static ResolvedPlayer? Keep(LaunchStore store, IssuedLaunch launch, IPEndPoint from, ulong counter) =>
         KeepDatagram(store, launch, from, LaunchEnvelope.Keep(launch.Key, launch.IdBytes, counter));
 
-    private static (ResolvedPlayer Player, byte[] Alive)? KeepDatagram(LaunchStore store, IssuedLaunch launch, IPEndPoint from, byte[] datagram)
+    private static ResolvedPlayer? KeepDatagram(LaunchStore store, IssuedLaunch launch, IPEndPoint from, byte[] datagram)
     {
         Assert.True(LaunchEnvelope.TryParse(datagram, out LaunchEnvelope.Message message));
         Assert.Equal(LaunchEnvelope.Kind.Keep, message.Kind);
@@ -190,28 +190,42 @@ public sealed class LaunchStoreTests
     }
 
     [Fact]
-    public void AKeepFromTheProvedSocketIsAnsweredWithAnAuthenticatedAlive()
+    public void AKeepFromTheProvedSocketKeepsItsLaunch()
     {
         var store = NewStore();
-        IssuedLaunch launch = IssueAndProve(store);
+        ResolvedPlayer player = NewPlayer();
+        IssuedLaunch launch = IssueAndProve(store, player);
 
-        var kept = Keep(store, launch, Game, counter: 1);
-
-        Assert.NotNull(kept);
-        // The shim checks ALIVE with the key: it is this server, answering this KEEP.
-        Assert.True(LaunchEnvelope.TryReadReply(kept.Value.Alive, LaunchEnvelope.Kind.Alive, launch.IdBytes, out byte[] body));
-        Assert.True(LaunchEnvelope.TryReadReply(LaunchEnvelope.Alive(launch.Key, launch.IdBytes, 1), LaunchEnvelope.Kind.Alive, launch.IdBytes, out byte[] expected));
-        Assert.Equal(expected, body);
+        Assert.Same(player, Keep(store, launch, Game, counter: 1));
     }
 
     [Fact]
-    public void AKeepBeforeAnyProofIsRefused()
+    public void AKeepBindsALaunchThatIsBoundNowhereYet()
     {
+        // After a game-server restart the shim acquires a fresh launch over
+        // HTTPS and binds the game's socket with a KEEP, since an answer on
+        // that socket would go to the game rather than to the shim.
         var store = NewStore();
         IssuedLaunch launch = store.Issue(NewPlayer());
 
-        // Holding the key is not enough: a launch is kept only from the socket it was proved on.
-        Assert.Null(Keep(store, launch, Game, counter: 1));
+        Assert.NotNull(Keep(store, launch, Game, counter: 1));
+        Assert.Equal(Game, store.BoundSocket(launch.Id));
+        // And from then on only that socket keeps it.
+        Assert.Null(Keep(store, launch, Eavesdropper, counter: 2));
+    }
+
+    [Fact]
+    public void AKeepCopiedOffTheWireCannotBindAnotherSocket()
+    {
+        // Somebody on the segment reads the first KEEP of a fresh launch and
+        // sends it from their own socket: the counter is spent by the original.
+        var store = NewStore();
+        IssuedLaunch launch = store.Issue(NewPlayer());
+        byte[] first = LaunchEnvelope.Keep(launch.Key, launch.IdBytes, 1);
+
+        Assert.NotNull(KeepDatagram(store, launch, Game, first));
+        Assert.Null(KeepDatagram(store, launch, Eavesdropper, first));
+        Assert.Equal(Game, store.BoundSocket(launch.Id));
     }
 
     [Fact]
@@ -261,5 +275,135 @@ public sealed class LaunchStoreTests
         Assert.Null(Keep(store, old, Game, counter: 1));
         Assert.Null(store.Challenge(old.IdBytes, Game));
         Assert.NotNull(Keep(store, renewed, Game, counter: 1));
+    }
+
+    // -----------------------------------------------------------------
+    // Renewal: a new launch for the same socket, asked for over HTTPS
+    // -----------------------------------------------------------------
+
+    /// <summary>The player as a renewal's fresh token names them: same account, new jti.</summary>
+    private static ResolvedPlayer WithNewToken(ResolvedPlayer player) =>
+        player with { Identity = player.Identity with { TokenId = Guid.NewGuid().ToString() } };
+
+    private static byte[] RenewalProof(IssuedLaunch old, ResolvedPlayer renewing) =>
+        LaunchEnvelope.ExpectedRenewal(old.Key, old.IdBytes, renewing.Identity.TokenId);
+
+    [Fact]
+    public void ARenewalMovesTheSocketToANewLaunchAndRetiresTheOld()
+    {
+        var store = NewStore();
+        IssuedLaunch old = IssueAndProve(store);
+        ResolvedPlayer renewing = WithNewToken(old.Player);
+
+        IssuedLaunch? renewed = store.Renew(old.IdBytes, renewing, RenewalProof(old, renewing));
+
+        Assert.NotNull(renewed);
+        Assert.Equal(Game, store.BoundSocket(renewed.Id));
+        Assert.Null(store.BoundSocket(old.Id));
+        Assert.NotNull(Keep(store, renewed, Game, counter: 1));
+    }
+
+    [Fact]
+    public void ARenewalNeedsTheOldLaunchsKey()
+    {
+        var store = NewStore();
+        IssuedLaunch old = IssueAndProve(store);
+        ResolvedPlayer renewing = WithNewToken(old.Player);
+        byte[] forged = LaunchEnvelope.ExpectedRenewal(RandomNumberGenerator.GetBytes(32), old.IdBytes, renewing.Identity.TokenId);
+
+        Assert.Null(store.Renew(old.IdBytes, renewing, forged));
+        Assert.Equal(Game, store.BoundSocket(old.Id));
+    }
+
+    [Fact]
+    public void ARenewalProofIsTiedToItsToken()
+    {
+        // A renewal proof read off an HTTPS request's logs cannot be used with
+        // another token: it is a MAC over the jti it was made for.
+        var store = NewStore();
+        IssuedLaunch old = IssueAndProve(store);
+        byte[] proofForAnotherToken = RenewalProof(old, WithNewToken(old.Player));
+
+        Assert.Null(store.Renew(old.IdBytes, WithNewToken(old.Player), proofForAnotherToken));
+    }
+
+    [Fact]
+    public void ARenewalIsForTheLaunchsOwnAccountOnly()
+    {
+        var store = NewStore();
+        IssuedLaunch old = IssueAndProve(store);
+        ResolvedPlayer someoneElse = NewPlayer("account-two");
+
+        Assert.Null(store.Renew(old.IdBytes, someoneElse, RenewalProof(old, someoneElse)));
+    }
+
+    [Fact]
+    public void ALaunchNeverBoundCannotBeRenewed()
+    {
+        // There is no socket to carry over; a fresh launch is what it needs.
+        var store = NewStore();
+        IssuedLaunch old = store.Issue(NewPlayer());
+        ResolvedPlayer renewing = WithNewToken(old.Player);
+
+        Assert.Null(store.Renew(old.IdBytes, renewing, RenewalProof(old, renewing)));
+    }
+
+    private static byte[] CheckProof(IssuedLaunch launch) => LaunchEnvelope.ExpectedCheck(launch.Key, launch.IdBytes);
+
+    [Fact]
+    public void ACheckWithTheLaunchsKeyFindsItHeld()
+    {
+        var store = NewStore();
+        IssuedLaunch launch = IssueAndProve(store);
+
+        Assert.True(store.Holds(launch.IdBytes, CheckProof(launch)));
+    }
+
+    [Fact]
+    public void ACheckWithoutTheKeyAnswersLikeALaunchNeverIssued()
+    {
+        // The id travels in the clear in every KEEP; the answer is for whoever
+        // holds the key, not for whoever read the id.
+        var store = NewStore();
+        IssuedLaunch launch = IssueAndProve(store);
+        byte[] forged = LaunchEnvelope.ExpectedCheck(RandomNumberGenerator.GetBytes(32), launch.IdBytes);
+
+        Assert.False(store.Holds(launch.IdBytes, forged));
+        Assert.False(store.Holds(RandomNumberGenerator.GetBytes(LaunchEnvelope.LaunchIdLength), CheckProof(launch)));
+    }
+
+    [Fact]
+    public void ALaunchThatWentQuietIsNoLongerHeld()
+    {
+        // The case the check exists for: the player's network is down past the
+        // idle timeout, no restart happens, and the shim must still find out.
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var idle = TimeSpan.FromMinutes(10);
+        var store = new LaunchStore(TimeSpan.FromHours(8), idle, time);
+        IssuedLaunch launch = IssueAndProve(store);
+
+        time.Advance(idle - TimeSpan.FromSeconds(1));
+        Assert.True(store.Holds(launch.IdBytes, CheckProof(launch)));
+
+        time.Advance(TimeSpan.FromSeconds(2));
+        Assert.False(store.Holds(launch.IdBytes, CheckProof(launch)));
+    }
+
+    [Fact]
+    public void AskingIsNotASignOfLife()
+    {
+        // Only the game's socket keeps a launch: checks every minute over HTTPS
+        // do not hold open a launch whose KEEPs have stopped arriving.
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var idle = TimeSpan.FromMinutes(10);
+        var store = new LaunchStore(TimeSpan.FromHours(8), idle, time);
+        IssuedLaunch launch = IssueAndProve(store);
+
+        for (int minute = 0; minute <= idle.TotalMinutes; minute++)
+        {
+            time.Advance(TimeSpan.FromMinutes(1));
+            store.Holds(launch.IdBytes, CheckProof(launch));
+        }
+        Assert.False(store.Holds(launch.IdBytes, CheckProof(launch)));
     }
 }

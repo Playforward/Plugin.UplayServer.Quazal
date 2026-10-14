@@ -402,8 +402,8 @@ internal sealed class PlayforwardGateway : IDisposable
 
     /// <summary>
     /// Verifies a token and issues a launch for the player it names: a public
-    /// id and a secret key, which the desktop client hands the game's shim so
-    /// it can prove, on the game's own socket, that it is this player's game.
+    /// id and a secret key, which the game's shim then proves it holds, on the
+    /// game's own socket, so that socket's login is this player.
     /// </summary>
     public IssuedLaunch? PreLaunch(string token)
     {
@@ -420,6 +420,39 @@ internal sealed class PlayforwardGateway : IDisposable
             string.IsNullOrEmpty(player.Identity.PartyRef) ? "none" : player.Identity.PartyRef);
         return launch;
     }
+
+    /// <summary>
+    /// Renews a bound launch before its ceiling: verifies the new token, checks
+    /// the proof made with the old launch's key (<see cref="LaunchEnvelope.ExpectedRenewal"/>),
+    /// and moves the old launch's socket binding to the new one. A renewal
+    /// re-reads the player's claims from Playforward, as every token does, so a
+    /// long session is never more than one launch out of date.
+    /// </summary>
+    public IssuedLaunch? Renew(string token, ReadOnlySpan<byte> launchId, ReadOnlySpan<byte> proof)
+    {
+        ResolvedPlayer? player = Redeem(token);
+        if (player is null)
+            return null;
+
+        IssuedLaunch? renewed = _launches.Renew(launchId, player, proof);
+        if (renewed is null || _launches.BoundSocket(renewed.Id) is not { } socket)
+            return null;
+
+        BindSocket(socket, player);
+        _launches.Refresh(player);
+        Rebind(player);
+        Log.Information("[playforward] renewed {DisplayName} ({AccountId})'s launch as {LaunchId}; {Socket} stays bound as pid={Pid}",
+            player.Identity.DisplayName, player.Identity.AccountId, renewed.Id, socket, player.Pid);
+        return renewed;
+    }
+
+    /// <summary>
+    /// Whether this server still holds a launch; see <see cref="LaunchStore.Holds"/>.
+    /// </summary>
+    public bool HoldsLaunch(ReadOnlySpan<byte> launchId, ReadOnlySpan<byte> proof) => _launches.Holds(launchId, proof);
+
+    /// <summary>The socket a launch is bound to, or null. For the harness, which watches a shim bind.</summary>
+    internal IPEndPoint? LaunchSocket(string launchId) => _launches.BoundSocket(launchId);
 
     /// <summary>
     /// Handles a datagram from a game's shim, if that is what it is: answers
@@ -455,10 +488,10 @@ internal sealed class PlayforwardGateway : IDisposable
                 return bound;
 
             case LaunchEnvelope.Kind.Keep:
-                if (_launches.Keep(message.LaunchId, source, message.Body) is not var (kept, alive))
-                    return null;
-                KeepSocketBinding(source, kept);
-                return alive;
+                // Never answered: see LaunchEnvelope.Kind.Keep.
+                if (_launches.Keep(message.LaunchId, source, message.Body) is { } kept)
+                    KeepSocketBinding(source, kept);
+                return null;
 
             default:
                 return null;
@@ -511,10 +544,17 @@ internal sealed class PlayforwardGateway : IDisposable
     public ResolvedPlayer? ForAddress(IPAddress address) => Bound(AddressKey(address));
 
     /// <summary>
+    /// Returns the account this socket proved a launch for, or null. Unlike
+    /// <see cref="ForEndpoint"/> it never falls back to the address, so a log
+    /// can say which of the two let a login in.
+    /// </summary>
+    public ResolvedPlayer? ForSocket(IPEndPoint endpoint) => Bound(EndpointKey(endpoint));
+
+    /// <summary>
     /// Returns the account a login from this socket is, or null
     /// </summary>
     public ResolvedPlayer? ForEndpoint(IPEndPoint endpoint) =>
-        Bound(EndpointKey(endpoint)) ?? ForAddress(endpoint.Address);
+        ForSocket(endpoint) ?? ForAddress(endpoint.Address);
 
     /// <summary>
     /// The addresses and sockets that currently have a binding, for a refusal

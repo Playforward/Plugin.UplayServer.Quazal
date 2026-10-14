@@ -93,20 +93,126 @@ internal static class PlayforwardRoutes
             return true;
         }
 
+        RespondWithLaunch(server, gateway, launch);
+        return true;
+    }
+
+    /// <summary>
+    /// POST /playforward/renew  {"token": "...", "launch": "&lt;old id, hex&gt;",
+    ///                           "proof": "&lt;hex HMAC under the old key&gt;"}
+    ///   -> 200, as pre-launch
+    ///
+    /// </summary>
+    [HTTP("POST", "/playforward/renew")]
+    public static bool Renew(ServerSender server)
+    {
+        if (!TryGateway(server, out PlayforwardGateway? gateway, out string? token))
+            return true;
+
+        IssuedLaunch? renewed = null;
+        if (TryReadHex(server.Request.Body, "launch", out byte[] launchId) && launchId.Length == LaunchEnvelope.LaunchIdLength &&
+            TryReadHex(server.Request.Body, "proof", out byte[] proof))
+        {
+            renewed = gateway.Renew(token, launchId, proof);
+        }
+        if (renewed is null)
+        {
+            Respond(server, 401, "{\"error\":\"renewal refused\"}");
+            return true;
+        }
+
+        RespondWithLaunch(server, gateway, renewed);
+        return true;
+    }
+
+    /// <summary>
+    /// POST /playforward/launch-check  {"launch": "&lt;id, hex&gt;",
+    ///                                  "proof": "&lt;hex HMAC under its key&gt;"}
+    ///   -> 200 <c>LIVE</c> or <c>GONE</c> as text/plain, {"live": bool} otherwise
+    ///
+    /// </summary>
+    [HTTP("POST", "/playforward/launch-check")]
+    public static bool LaunchCheck(ServerSender server)
+    {
+        if (!PlayforwardTitles.Any)
+        {
+            Respond(server, 503, """{"error":"playforward login is not enabled on this server"}""");
+            return true;
+        }
+        if (!PlayforwardTitles.All.Any(title => MayServe(server.Session is NetCoreServer.SslSession, CallerAddress(server), title.Gateway)))
+        {
+            RefusePlainHttp(server);
+            return true;
+        }
+        if (!TryReadHex(server.Request.Body, "launch", out byte[] launchId) || launchId.Length != LaunchEnvelope.LaunchIdLength ||
+            !TryReadHex(server.Request.Body, "proof", out byte[] proof))
+        {
+            Respond(server, 400, """{"error":"a launch and its proof are required"}""");
+            return true;
+        }
+
+        // Launch ids are random and per title, so at most one gateway holds it.
+        bool live = PlayforwardTitles.All.Any(title => title.Gateway.HoldsLaunch(launchId, proof));
+        if (WantsLine(server))
+            RespondText(server, 200, live ? "LIVE\n" : "GONE\n");
+        else
+            Respond(server, 200, JsonSerializer.Serialize(new { live }));
+        return true;
+    }
+
+    /// <summary>
+    /// Identifies this run of the server. Launches and bindings live in memory,
+    /// so a different boot id means both were lost. The shim learns that from
+    /// <see cref="LaunchCheck"/>, which also covers a launch forgotten without a
+    /// restart; the boot id stays on the status page and the launch line for
+    /// the logs and the desktop client.
+    /// </summary>
+    internal static readonly string BootId =
+        Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(BootIdLength)).ToLowerInvariant();
+
+    /// <summary>As wide as a launch id: random, and never the same twice.</summary>
+    private const int BootIdLength = LaunchEnvelope.LaunchIdLength;
+
+    /// <summary>
+    /// Answers a launch, as JSON for the desktop client, or as one line for a
+    /// shim that asks for <c>text/plain</c>:
+    /// <c>LAUNCH &lt;id hex&gt; &lt;key hex&gt; &lt;expires in seconds&gt; &lt;boot id&gt;</c>.
+    /// The line is what the shim reads inside the game process, where a JSON
+    /// parser would be one more thing to carry for four fields.
+    /// </summary>
+    private static void RespondWithLaunch(ServerSender server, PlayforwardGateway gateway, IssuedLaunch launch)
+    {
+        int expiresIn = (int)Math.Max(0, (launch.ExpiresAt - DateTimeOffset.UtcNow).TotalSeconds);
+        if (WantsLine(server))
+        {
+            RespondText(server, 200, LaunchLine(launch, expiresIn));
+            return;
+        }
+
         Respond(server, 200, JsonSerializer.Serialize(new
         {
             pid = launch.Player.Pid,
             display_name = launch.Player.Identity.DisplayName,
             login_name = gateway.LoginNameFor(launch.Player.Identity),
+            boot_id = BootId,
             launch = new
             {
                 id = launch.Id,
                 key = Convert.ToBase64String(launch.Key),
-                expires_in_seconds = (int)Math.Max(0, (launch.ExpiresAt - DateTimeOffset.UtcNow).TotalSeconds),
+                expires_in_seconds = expiresIn,
             },
         }));
-        return true;
     }
+
+    /// <summary>The one-line form of a launch; see <see cref="RespondWithLaunch"/>.</summary>
+    /// <param name="bootId">This run's, unless a harness standing in for a restarted server names another.</param>
+    internal static string LaunchLine(IssuedLaunch launch, int expiresInSeconds, string? bootId = null) =>
+        $"LAUNCH {launch.Id} {Convert.ToHexString(launch.Key).ToLowerInvariant()} {expiresInSeconds} {bootId ?? BootId}\n";
+
+    /// <summary>Whether the caller asked for the one-line answers a shim reads.</summary>
+    private static bool WantsLine(ServerSender server) =>
+        server.Headers.TryGetValue("accept", out string? accept) &&
+        accept.Contains("text/plain", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// GET /playforward/status
@@ -122,7 +228,10 @@ internal static class PlayforwardRoutes
             Respond(server, 503, """{"error":"playforward login is not enabled on this server"}""");
             return true;
         }
-        Respond(server, 200, StatusDocument(PlayforwardTitles.All, DateTimeOffset.UtcNow));
+        if (WantsLine(server))
+            RespondText(server, 200, $"BOOT {BootId}\n");
+        else
+            Respond(server, 200, StatusDocument(PlayforwardTitles.All, DateTimeOffset.UtcNow));
         return true;
     }
 
@@ -133,6 +242,7 @@ internal static class PlayforwardRoutes
         JsonSerializer.Serialize(new
         {
             time = now.ToUnixTimeSeconds(),
+            boot_id = BootId,
             titles = titles.Select(title => new
             {
                 title_id = title.TitleId,
@@ -180,14 +290,19 @@ internal static class PlayforwardRoutes
 
         if (!MayServe(server.Session is NetCoreServer.SslSession, CallerAddress(server), gateway))
         {
-            Log.Warning("[playforward] refused a plain-HTTP request from {Caller}, which is outside LanNetworks: these routes need TLS from there",
-                CallerAddress(server));
-            Respond(server, 403, """{"error":"this endpoint requires https from outside the server's local network"}""");
+            RefusePlainHttp(server);
             token = null;
             gateway = null;
             return false;
         }
         return true;
+    }
+
+    private static void RefusePlainHttp(ServerSender server)
+    {
+        Log.Warning("[playforward] refused a plain-HTTP request from {Caller}, which is outside LanNetworks: these routes need TLS from there",
+            CallerAddress(server));
+        Respond(server, 403, """{"error":"this endpoint requires https from outside the server's local network"}""");
     }
 
     /// <summary>
@@ -201,7 +316,10 @@ internal static class PlayforwardRoutes
     private static System.Net.IPAddress? CallerAddress(ServerSender server) =>
         (server.Session.Socket.RemoteEndPoint as System.Net.IPEndPoint)?.Address;
 
-    private static string? ReadToken(string? body)
+    private static string? ReadToken(string? body) => ReadString(body, "token");
+
+    /// <summary>One string field of a JSON body, or null.</summary>
+    private static string? ReadString(string? body, string name)
     {
         if (string.IsNullOrWhiteSpace(body))
             return null;
@@ -209,7 +327,7 @@ internal static class PlayforwardRoutes
         try
         {
             using JsonDocument document = JsonDocument.Parse(body);
-            return document.RootElement.TryGetProperty("token", out JsonElement value) && value.ValueKind == JsonValueKind.String
+            return document.RootElement.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
                 ? value.GetString()
                 : null;
         }
@@ -219,12 +337,35 @@ internal static class PlayforwardRoutes
         }
     }
 
-    private static void Respond(ServerSender server, int status, string json)
+    /// <summary>One hex field of a JSON body, decoded; false if absent or not hex.</summary>
+    private static bool TryReadHex(string? body, string name, out byte[] bytes)
+    {
+        bytes = [];
+        if (ReadString(body, name) is not { } hex)
+            return false;
+        try
+        {
+            bytes = Convert.FromHexString(hex);
+            return true;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    private static void Respond(ServerSender server, int status, string json) =>
+        RespondWith(server, status, "application/json", json);
+
+    private static void RespondText(ServerSender server, int status, string text) =>
+        RespondWith(server, status, "text/plain; charset=utf-8", text);
+
+    private static void RespondWith(ServerSender server, int status, string contentType, string body)
     {
         server.Response.Clear();
         server.Response.SetBegin(status);
-        server.Response.SetHeader("Content-Type", "application/json");
-        server.Response.SetBody(json);
+        server.Response.SetHeader("Content-Type", contentType);
+        server.Response.SetBody(body);
         server.SendResponse();
     }
 }

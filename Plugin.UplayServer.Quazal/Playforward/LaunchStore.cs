@@ -5,11 +5,13 @@ using System.Security.Cryptography;
 namespace Plugin.UplayServer.Quazal.Playforward;
 
 /// <summary>
-/// A launch this server has issued: the key the desktop client hands the
-/// game's shim, and the player it stands for.
+/// A launch this server has issued: the key the game's shim proves it holds,
+/// and the player it stands for.
 /// </summary>
 /// <param name="Id">Public. Names the launch on the wire; safe for anyone to see.</param>
-/// <param name="Key">Secret. Goes to the client over HTTPS, to the shim over a local pipe, and nowhere else.</param>
+/// <param name="Key">
+/// Secret. Goes back over the HTTPS request that issued it
+/// </param>
 /// <param name="ExpiresAt">
 /// The latest the shim can prove this launch. It ends sooner if its player
 /// goes quiet, see <see cref="PlayforwardSettings.LaunchIdleTimeoutSeconds"/>.
@@ -161,12 +163,15 @@ internal sealed class LaunchStore
     }
 
     /// <summary>
-    /// Checks a KEEP: it must come from the socket the launch was proved from,
-    /// carry a counter higher than any before it, and be authenticated with the
-    /// launch's key. On success the launch is kept alive, and its player and the
-    /// ALIVE reply come back; on any failure, null.
+    /// Checks a KEEP: authenticated with the launch's key, carrying a counter
+    /// higher than any before it, and from the socket the launch is bound to.
+    /// A launch bound to no socket yet is bound to the first one a good KEEP
+    /// comes from: that is how a shim whose server restarted, and so forgot its
+    /// binding, binds the game's socket again without needing an answer on it.
+    /// On success the launch is kept alive and its player comes back; on any
+    /// failure, null.
     /// </summary>
-    public (ResolvedPlayer Player, byte[] Alive)? Keep(ReadOnlySpan<byte> launchId, IPEndPoint from, ReadOnlySpan<byte> body)
+    public ResolvedPlayer? Keep(ReadOnlySpan<byte> launchId, IPEndPoint from, ReadOnlySpan<byte> body)
     {
         Prune();
 
@@ -182,23 +187,98 @@ internal sealed class LaunchStore
             return null;
         }
 
+        bool bindsNow;
         lock (live.Gate)
         {
-            if (live.BoundTo is null || !live.BoundTo.Equals(from))
-            {
-                Log.Debug("[playforward] refused a KEEP from {From}: its launch was proved from {Proved}", from, live.BoundTo);
-                return null;
-            }
             if (counter <= live.LastCounter)
             {
                 Log.Debug("[playforward] refused a KEEP from {From} replaying counter {Counter}", from, counter);
                 return null;
             }
+            if (live.BoundTo is not null && !live.BoundTo.Equals(from))
+            {
+                Log.Debug("[playforward] refused a KEEP from {From}: its launch is bound to {Bound}", from, live.BoundTo);
+                return null;
+            }
+            bindsNow = live.BoundTo is null;
+            live.BoundTo = from;
             live.LastCounter = counter;
         }
 
         live.LastActive.Touch(_time.GetUtcNow());
-        return (launch.Player, LaunchEnvelope.Alive(launch.Key, launch.IdBytes, counter));
+        if (bindsNow)
+            RetireOthersBoundTo(from, id);
+        return launch.Player;
+    }
+
+    /// <summary>
+    /// Replaces a bound launch with a fresh one for the same socket, before the
+    /// old one reaches its ceiling. The shim asks over HTTPS, with a new token
+    /// and <see cref="LaunchEnvelope.ExpectedRenewal"/> under the old key, so no
+    /// answer has to come back on the game's socket. Returns the new launch, or
+    /// null with the reason logged.
+    /// </summary>
+    /// <param name="player">Who the new token is for; it must be the old launch's account.</param>
+    public IssuedLaunch? Renew(ReadOnlySpan<byte> launchId, ResolvedPlayer player, ReadOnlySpan<byte> proof)
+    {
+        Prune();
+
+        string id = Convert.ToHexString(launchId).ToLowerInvariant();
+        if (!_launches.TryGetValue(id, out LiveLaunch? old))
+        {
+            Log.Warning("[playforward] refused to renew launch {LaunchId}: this server does not hold it", id);
+            return null;
+        }
+        if (!string.Equals(old.Launch.Player.Identity.AccountId, player.Identity.AccountId, StringComparison.Ordinal))
+        {
+            Log.Warning("[playforward] refused to renew launch {LaunchId} with a token for another account", id);
+            return null;
+        }
+        byte[] expected = LaunchEnvelope.ExpectedRenewal(old.Launch.Key, old.Launch.IdBytes, player.Identity.TokenId);
+        if (!CryptographicOperations.FixedTimeEquals(expected, proof))
+        {
+            Log.Warning("[playforward] refused to renew launch {LaunchId}: the proof is not made with its key", id);
+            return null;
+        }
+
+        IPEndPoint? socket;
+        lock (old.Gate)
+            socket = old.BoundTo;
+        if (socket is null)
+        {
+            Log.Warning("[playforward] refused to renew launch {LaunchId}: it was never bound, so there is nothing to carry over", id);
+            return null;
+        }
+
+        IssuedLaunch renewed = Issue(player);
+        LiveLaunch fresh = _launches[renewed.Id];
+        lock (fresh.Gate)
+            fresh.BoundTo = socket;
+        RetireOthersBoundTo(socket, renewed.Id);
+        return renewed;
+    }
+
+    /// <summary>
+    /// Whether this server still holds a launch, asked by the shim holding its
+    /// key (<see cref="LaunchEnvelope.ExpectedCheck"/>). A launch can be
+    /// forgotten without the server restarting
+    /// </summary>
+    public bool Holds(ReadOnlySpan<byte> launchId, ReadOnlySpan<byte> proof)
+    {
+        Prune();
+
+        string id = Convert.ToHexString(launchId).ToLowerInvariant();
+        return _launches.TryGetValue(id, out LiveLaunch? live) &&
+               CryptographicOperations.FixedTimeEquals(LaunchEnvelope.ExpectedCheck(live.Launch.Key, live.Launch.IdBytes), proof);
+    }
+
+    /// <summary>The socket a launch is bound to, or null.</summary>
+    public IPEndPoint? BoundSocket(string launchId)
+    {
+        if (!_launches.TryGetValue(launchId, out LiveLaunch? live))
+            return null;
+        lock (live.Gate)
+            return live.BoundTo;
     }
 
     /// <summary>

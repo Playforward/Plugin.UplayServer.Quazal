@@ -433,6 +433,9 @@ public sealed class QuazalSettings
                         title, username, expected, cap);
                     return null;
                 }
+                Serilog.Log.Information("[playforward] {Title}: {DisplayName} (pid={Pid}) logging in from {Source}, bound by {Binding}",
+                    title, bound.Identity.DisplayName, bound.Pid, source,
+                    gateway.ForSocket(source) is not null ? "its proved launch" : "its address");
                 return PlayforwardAccountFor(playforward, bound);
             }
 

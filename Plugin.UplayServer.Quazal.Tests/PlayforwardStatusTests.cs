@@ -37,5 +37,22 @@ public sealed class PlayforwardStatusTests
         // The client compares this with the key id Playforward signs with now.
         Assert.Equal([tokens.KeyId], entry.GetProperty("key_ids").EnumerateArray().Select(id => id.GetString()));
         Assert.Equal(settings.ClockSkewSeconds, entry.GetProperty("clock_skew_seconds").GetInt32());
+        Assert.Equal(PlayforwardRoutes.BootId, status.RootElement.GetProperty("boot_id").GetString());
+    }
+
+    [Fact]
+    public void ALaunchLineIsWhatTheShimParses()
+    {
+        // The shim reads this inside the game process (UplaySDKShim's
+        // launch_envelope parse_launch_line): LAUNCH, the id, the key and the
+        // boot id as lowercase hex, and the seconds left, one space apart.
+        byte[] key = Enumerable.Range(0, 32).Select(i => (byte)i).ToArray();
+        var launch = new IssuedLaunch("00112233445566778899aabbccddeeff", key, DateTimeOffset.UtcNow.AddHours(8),
+            new ResolvedPlayer(new PlayforwardIdentity("account", "Player", "player", "plyr", "user", "", "jti", DateTimeOffset.UtcNow), 2_000_001));
+
+        string line = PlayforwardRoutes.LaunchLine(launch, expiresInSeconds: 28_800);
+
+        Assert.Matches(@"^LAUNCH [0-9a-f]{32} [0-9a-f]{64} [0-9]+ [0-9a-f]{32}\n$", line);
+        Assert.Equal($"LAUNCH 00112233445566778899aabbccddeeff {Convert.ToHexString(key).ToLowerInvariant()} 28800 {PlayforwardRoutes.BootId}\n", line);
     }
 }
