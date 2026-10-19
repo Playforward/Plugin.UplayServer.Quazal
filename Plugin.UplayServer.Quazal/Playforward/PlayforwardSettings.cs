@@ -17,6 +17,37 @@ public sealed class PlayforwardTitleSettings
     public string ServerSecret { get; set; } = string.Empty;
 
     /// <summary>
+    /// A file holding <see cref="ServerSecret"/> instead, for an operator who
+    /// keeps credentials out of the settings file (a systemd credential, a
+    /// Docker secret, a file only the service user can read). Leading and
+    /// trailing whitespace is ignored. Set this or ServerSecret, not both.
+    /// </summary>
+    public string ServerSecretFile { get; set; } = string.Empty;
+
+    /// <summary>
+    /// The secret from whichever of <see cref="ServerSecret"/> and
+    /// <see cref="ServerSecretFile"/> is set, or null with the reason.
+    /// </summary>
+    public string? ResolveSecret(out string? error)
+    {
+        error = null;
+        if (string.IsNullOrWhiteSpace(ServerSecretFile))
+            return ServerSecret;
+        try
+        {
+            string secret = File.ReadAllText(ServerSecretFile).Trim();
+            if (secret.Length > 0)
+                return secret;
+            error = $"ServerSecretFile '{ServerSecretFile}' is empty";
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            error = $"ServerSecretFile '{ServerSecretFile}' could not be read: {exception.Message}";
+        }
+        return null;
+    }
+
+    /// <summary>
     /// The registration id Playforward gave this title's server, shown with its
     /// secret. Tokens and moderation commands are minted for one server, and
     /// this is how the server knows which audience is its own.
@@ -51,8 +82,12 @@ public sealed class PlayforwardTitleSettings
     public IEnumerable<string> Validate(string titleId)
     {
         string at = $"Titles['{titleId}'].Playforward";
-        if (string.IsNullOrWhiteSpace(ServerSecret))
-            yield return $"{at}.ServerSecret is required; an admin issues one with POST /api/v1/admin/gameservers for that title";
+        bool inline = !string.IsNullOrWhiteSpace(ServerSecret);
+        bool fromFile = !string.IsNullOrWhiteSpace(ServerSecretFile);
+        if (!inline && !fromFile)
+            yield return $"{at}.ServerSecret or {at}.ServerSecretFile is required; an admin issues one with POST /api/v1/admin/gameservers for that title";
+        if (inline && fromFile)
+            yield return $"{at} sets both ServerSecret and ServerSecretFile; set one, so it is clear which secret this server uses";
         if (string.IsNullOrWhiteSpace(TemplateAccountUsername))
             yield return $"{at}.TemplateAccountUsername is required";
         if (LoginNameMaxLength < 1)
@@ -69,6 +104,16 @@ public sealed class PlayforwardSettings
 {
     /// <summary>Whether players may authenticate with Playforward tokens.</summary>
     public bool Enabled { get; set; }
+
+    /// <summary>
+    /// With Playforward enabled, whether a title whose Playforward half could
+    /// not be brought up (a bad secret, Playforward unreachable at start) is
+    /// left unserved rather than served with local logins. On by default: a
+    /// public server that quietly fell back to local logins would let anybody
+    /// log in under any name, including the names of Playforward players the
+    /// directory sent there. Turn it off only on a LAN.
+    /// </summary>
+    public bool RequireOnEveryTitle { get; set; } = true;
 
     /// <summary>
     /// A pinned Ed25519 public key, raw and base64url (the JWKS <c>"x"</c>

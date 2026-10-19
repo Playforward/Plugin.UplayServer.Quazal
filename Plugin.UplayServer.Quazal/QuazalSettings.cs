@@ -79,6 +79,13 @@ public enum QuazalProtocolFamily
     /// is not answered from the Overlord table. Catalog slug <c>futuresoldier</c>.
     /// </summary>
     FutureSoldier,
+    /// <summary>
+    /// Assassin's Creed Brotherhood's multiplayer (ACBMP.exe): OSDK 1.2.4,
+    /// the oldest RendezVous here, from before Overlord and before Far Cry
+    /// 3's extensions. Answered from the shared services only until its own
+    /// calls are seen on the wire. Catalog slug <c>brotherhood</c>.
+    /// </summary>
+    Brotherhood,
 }
 
 /// <summary>Local RendezVous listener settings shared by every title.</summary>
@@ -115,6 +122,13 @@ public sealed class QuazalSettings
     /// no accounts service at all.
     /// </summary>
     public Playforward.PlayforwardSettings Playforward { get; set; } = new();
+
+    /// <summary>
+    /// How a title with no Playforward half is served: open logins by name,
+    /// with PIDs and progress kept on this machine. On by default; see
+    /// <see cref="Standalone.StandaloneSettings"/>.
+    /// </summary>
+    public Standalone.StandaloneSettings Standalone { get; set; } = new();
 
     /// <summary>First PID allocated to the LAN player identities.</summary>
     public uint DynamicPlayerPidStart { get; set; } = 2000;
@@ -276,9 +290,12 @@ public sealed class QuazalSettings
     /// <summary>
     /// The most PRUDP sessions held at once. A game holds up to three (the
     /// authentication session, then the player's and the telemetry account's
-    /// on the secure port).
+    /// on the secure port), so this is about a third of the players the
+    /// server can hold across every title. Sessions that have not logged in
+    /// are displaced first when it is full, so a flood cannot crowd out
+    /// players who have.
     /// </summary>
-    public int MaxPeers { get; set; } = 8;
+    public int MaxPeers { get; set; } = 256;
 
     /// <summary>
     /// How long a session that has sent a SYN may go without completing its
@@ -309,9 +326,38 @@ public sealed class QuazalSettings
     /// <summary>
     /// Address embedded in named-RMC responses that hand the client a follow-up
     /// server to connect to (e.g. LoginWithToken_V1's and Register_V1's result
-    /// both end in a prudp:/address=...;port=... URL
+    /// both end in a prudp:/address=...;port=... URL, and the login reply's
+    /// secure server. Every client is sent there, so it must be the address
+    /// players reach this server on. Empty means this machine's LAN address,
+    /// worked out at start: right on a LAN or a host with a public address
+    /// of its own, wrong behind a port forward, where it must be set.
     /// </summary>
-    public string PublicHost { get; set; } = "127.0.0.1";
+    public string PublicHost { get; set; } = string.Empty;
+
+    /// <summary>
+    /// <see cref="PublicHost"/>, or this machine's LAN address when it is
+    /// empty: the address this machine routes out of, which is loopback when
+    /// it has no route at all.
+    /// </summary>
+    internal static string ResolvePublicHost(string configured)
+    {
+        if (!string.IsNullOrWhiteSpace(configured))
+            return configured.Trim();
+        try
+        {
+            using var socket = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.InterNetwork,
+                System.Net.Sockets.SocketType.Dgram, System.Net.Sockets.ProtocolType.Udp);
+            // Connecting a datagram socket sends nothing; it only picks a route.
+            socket.Connect(new System.Net.IPEndPoint(System.Net.IPAddress.Parse("10.255.255.255"), 1));
+            if (socket.LocalEndPoint is System.Net.IPEndPoint local && !System.Net.IPAddress.IsLoopback(local.Address))
+                return local.Address.ToString();
+        }
+        catch (System.Net.Sockets.SocketException)
+        {
+            // No route: loopback below.
+        }
+        return System.Net.IPAddress.Loopback.ToString();
+    }
 
     /// <summary>
     /// The account a plain Login (Ticket Granting method 1, not LoginEx) may
@@ -389,6 +435,7 @@ public sealed class QuazalSettings
         if (GatewayFor(title) is { } gateway && gateway.ForPid(pid) is { } bound)
             return gateway.LoginNameFor(bound.Identity);
         return FindAccountByPid(title, pid)?.Username
+            ?? Plugin.UplayServer.Quazal.Standalone.LocalTitles.ForTitle(title)?.NameFor(pid)
             ?? Plugin.UplayServer.Quazal.Playforward.PlayerNames.For(title.TitleId, pid)
             ?? pid.ToString();
     }
@@ -404,7 +451,7 @@ public sealed class QuazalSettings
         if (PlayforwardFor(title) is { } playforward && playforward.Gateway.ForPid(pid) is { } bound)
             return PlayforwardAccountFor(playforward, bound);
 
-        return null;
+        return Plugin.UplayServer.Quazal.Standalone.LocalTitles.ForTitle(title)?.AccountForPid(pid);
     }
 
     /// <summary>
@@ -445,7 +492,13 @@ public sealed class QuazalSettings
         }
 
         QuazalAccount? baseAccount = FindAccount(username);
-        if (baseAccount is null || !AssignPlayerPidByAddress)
+        if (baseAccount is null)
+        {
+            // Not a configured account: on a standalone title, any name is a
+            // player of its own; otherwise, nobody.
+            return Plugin.UplayServer.Quazal.Standalone.LocalTitles.ForTitle(title)?.Login(username, source);
+        }
+        if (!AssignPlayerPidByAddress)
             return baseAccount;
 
         string addressKey = address.ToString();

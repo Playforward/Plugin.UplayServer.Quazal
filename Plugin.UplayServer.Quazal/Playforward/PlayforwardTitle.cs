@@ -34,6 +34,9 @@ internal sealed class PlayforwardTitle : IDisposable
     /// </summary>
     public Guid? ServerId { get; }
 
+    /// <summary>Playforward's trust for a server no admin has verified yet.</summary>
+    private const string CommunityTrust = "community";
+
     private PlayforwardTitle(QuazalTitle title, string audience, PlayforwardTitleSettings settings,
         PlayforwardServerClient? client, IProgressStore store, PlayforwardGateway gateway, Guid? serverId)
     {
@@ -69,7 +72,14 @@ internal sealed class PlayforwardTitle : IDisposable
             return null;
         }
 
-        PlayforwardServerClient? client = PlayforwardServerClient.Create(global, settings.ServerSecret, title.TitleId);
+        string? secret = settings.ResolveSecret(out string? secretError);
+        if (secret is null)
+        {
+            Log.Error("[playforward] {Title}: {Error}", title, secretError);
+            return null;
+        }
+
+        PlayforwardServerClient? client = PlayforwardServerClient.Create(global, secret, title.TitleId);
         if (client is null)
             return null;
 
@@ -90,6 +100,8 @@ internal sealed class PlayforwardTitle : IDisposable
             Log.Information("[playforward] {Title}: secret confirmed as server \"{Name}\" ({ServerId}){Address}",
                 title, registration.Name, registration.ServerId,
                 string.IsNullOrEmpty(registration.PublicUrl) ? "; no public address, so clients are not offered it" : $" at {registration.PublicUrl}");
+            if (registration.Trust == CommunityTrust)
+                Log.Information("[playforward] {Title}: registered as a community server -- its scores go to the unranked boards and title-wide state is read-only until an admin verifies it", title);
         }
 
         Guid? serverId = ServerIdentity(title, settings.ServerId, registration?.ServerId);

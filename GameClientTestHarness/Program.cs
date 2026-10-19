@@ -19,6 +19,7 @@ return options.Mode switch
     HarnessMode.SelfTest => await SelfTest.RunAsync(options),
     HarnessMode.Bridge => await BridgeRun.RunAsync(options),
     HarnessMode.LaunchServer => await LaunchServerRun.RunAsync(options),
+    HarnessMode.Login => await PlainLoginRun.RunAsync(options),
     _ => Usage(),
 };
 
@@ -58,6 +59,13 @@ static int Usage()
             from Playforward and pre-register it with the game server directly.
             --playforward-url URL   with --account and --password, and
             --server-http URL       the game server's HTTP base, e.g. http://127.0.0.1:80
+
+        login      Log in by name to a running server, as the game does with no
+                   Playforward at all (a standalone title, or a LAN account):
+                   SYN, CONNECT, LoginEx over a real UDP socket. Prints the pid.
+
+            --server HOST:PORT      The title's authentication port, e.g. 127.0.0.1:6570.
+            --login NAME            The name to log in as.
 
         launchserver  Stand in for the server instead: listen on loopback UDP,
                    issue one launch, print it as the bridge would ("LAUNCH <id>

@@ -138,7 +138,7 @@ internal static class FutureSoldierStatistics
     /// </summary>
     public static ulong NextMatchId(string titleId)
     {
-        if (Playforward.PlayforwardTitles.ForTitle(titleId)?.Store.NextCounter(MatchIdCounter) is { } counted)
+        if (Standalone.PlayerStores.ForTitle(titleId)?.NextCounter(MatchIdCounter) is { } counted)
             return counted;
         return (ulong)Interlocked.Increment(ref _nextLocalMatchId);
     }
@@ -160,12 +160,9 @@ internal static class FutureSoldierStatistics
         return Players.GetOrAdd((titleId, pid), _ => new RowSet());
     }
 
-    /// <summary>The title's Playforward store, when the pid is one of its principals.</summary>
-    private static Playforward.IProgressStore? StoreFor(string titleId, uint pid)
-    {
-        Playforward.PlayforwardTitle? title = Playforward.PlayforwardTitles.ForTitle(titleId);
-        return title?.Gateway.ForPid(pid) is null ? null : title.Store;
-    }
+    /// <summary>The store the pid's progress is kept in (Playforward's or this machine's), or null when it is kept for this run only.</summary>
+    private static Playforward.IProgressStore? StoreFor(string titleId, uint pid) =>
+        Standalone.PlayerStores.ForPlayer(titleId, pid);
 
     /// <summary>Loads a Playforward player's rows once per session; false when there is nothing to load from or the load failed.</summary>
     private static bool TryPrime(string titleId, uint pid, out RowSet rows)
@@ -182,7 +179,7 @@ internal static class FutureSoldierStatistics
         if (blobs is null)
         {
             Primed[(titleId, pid)] = DateTimeOffset.UtcNow;
-            Log.Warning("[progress] could not load pid={Pid}'s {Title} statistics from Playforward; serving what this session holds", pid, titleId);
+            Log.Warning("[progress] could not load pid={Pid}'s {Title} statistics from {Store}; serving what this session holds", pid, titleId, Standalone.PlayerStores.Describe(titleId));
             return false;
         }
         var loaded = new RowSet();
@@ -196,7 +193,7 @@ internal static class FutureSoldierStatistics
         }
         rows = Players.GetOrAdd((titleId, pid), loaded);
         Primed[(titleId, pid)] = null;
-        Log.Information("[progress] pid={Pid}'s {Title} statistics loaded from Playforward: {Rows} row(s)", pid, titleId, rowCount);
+        Log.Information("[progress] pid={Pid}'s {Title} statistics loaded from {Store}: {Rows} row(s)", pid, titleId, Standalone.PlayerStores.Describe(titleId), rowCount);
         return true;
     }
 
@@ -204,7 +201,7 @@ internal static class FutureSoldierStatistics
     {
         Playforward.IProgressStore? store = StoreFor(titleId, pid);
         if (store is not null && !store.SaveBlob(pid, BlobNamespace, RowsKey, Serialize(rows)))
-            Log.Warning("[progress] could not save pid={Pid}'s {Title} statistics to Playforward; keeping them in memory for this session", pid, titleId);
+            Log.Warning("[progress] could not save pid={Pid}'s {Title} statistics to {Store}; keeping them in memory for this session", pid, titleId, Standalone.PlayerStores.Describe(titleId));
     }
 
     private static byte[] Serialize(RowSet rows)

@@ -98,12 +98,27 @@ internal static class TicketGranting
     /// </summary>
     public static byte[] DeriveKey(uint pid, string password)
     {
+        // Some 65,000 MD5s, and a Tracking login (which anybody may send)
+        // asks for one: remembered, so a stream of logins costs a lookup each.
+        if (_derivedKeys.TryGetValue((pid, password), out byte[]? known))
+            return known.ToArray();
+
         byte[] buffer = Encoding.ASCII.GetBytes(password);
         uint rounds = 65000 + (pid % 1024);
         for (uint n = 0; n < rounds; n++)
             buffer = MD5.HashData(buffer);
+
+        if (_derivedKeys.Count >= DerivedKeyCapacity)
+            _derivedKeys.Clear();
+        _derivedKeys[(pid, password)] = buffer.ToArray();
         return buffer;
     }
+
+    /// <summary>Keys <see cref="DeriveKey"/> has already worked out. Accounts are the server's, so few.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(uint Pid, string Password), byte[]> _derivedKeys = new();
+
+    /// <summary>The most derived keys remembered; past it the cache starts over.</summary>
+    private const int DerivedKeyCapacity = 4096;
 
     internal static void WriteString(Stream stream, string value)
     {

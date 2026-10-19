@@ -76,7 +76,7 @@ internal static class OnlineDataStore
         IReadOnlyList<Playforward.StoredBlob>? title = store.LoadTitle();
         if (title is null)
         {
-            Log.Warning("[progress] could not load this title's learned columns from Playforward; they will be relearned from the wire");
+            Log.Warning("[progress] could not load this title's learned columns from {Store}; they will be relearned from the wire", Standalone.PlayerStores.Describe(titleId));
             return;
         }
         int loaded = 0;
@@ -88,7 +88,7 @@ internal static class OnlineDataStore
                 foreach (string name in Encoding.UTF8.GetString(blob.Payload).Split('\n', StringSplitOptions.RemoveEmptyEntries))
                     if (known.Add(name)) loaded++;
         }
-        Log.Information("[progress] online-data store attached to Playforward: {Columns} learned column name(s) restored", loaded);
+        Log.Information("[progress] online-data store attached to {Store}: {Columns} learned column name(s) restored", Standalone.PlayerStores.Describe(titleId), loaded);
     }
 
     /// <summary>Drops the store and everything cached from it.</summary>

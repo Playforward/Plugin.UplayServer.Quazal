@@ -65,6 +65,7 @@ internal sealed partial class QuazalResponder
                 QuazalProtocolFamily.FarCry3 => BuildFarCry3Table(shared),
                 QuazalProtocolFamily.Overlord => BuildOverlordTable(shared),
                 QuazalProtocolFamily.FutureSoldier => BuildFutureSoldierTable(shared),
+                QuazalProtocolFamily.Brotherhood => BuildBrotherhoodTable(shared),
                 _ => throw new InvalidOperationException($"no protocol table for family {family}"),
             };
         }
@@ -102,6 +103,74 @@ internal sealed partial class QuazalResponder
         t.Add(TrackingProtocol.ProtocolId, TrackingProtocol.MethodGetConfiguration, (rmc, in _) => TrackingProtocol.BuildGetConfigurationResult());
         t.Add(TrackingProtocol.ProtocolId, TrackingProtocol.MethodSendUserInfo, (rmc, in _) => TrackingProtocol.BuildSendUserInfoResult(rmc));
 
+        return t;
+    }
+
+    /// <summary>
+    /// Assassin's Creed Brotherhood: the shared login, secure connection,
+    /// locale, NAT and telemetry services. Its game-specific calls are added
+    /// as the client is seen making them ("no handler registered" in the log
+    /// names each one), not guessed at from other titles' ids.
+    /// </summary>
+    private ProtocolTable BuildBrotherhoodTable(ProtocolTable shared)
+    {
+        ProtocolTable t = shared.Derive();
+        t.Add(BrotherhoodServices.GameInfo.ProtocolId, BrotherhoodServices.GameInfo.MethodGetFileList,
+            (rmc, in c) => BrotherhoodServices.GameInfo.BuildGetFileListResult(rmc, c.Title));
+        t.Add(BrotherhoodServices.PersistentStore.ProtocolId, BrotherhoodServices.PersistentStore.MethodGetItem,
+            (rmc, in c) => BrotherhoodServices.PersistentStore.BuildGetItemResult(rmc, c.Title));
+
+        // Standard RendezVous services; ids from the DDL embedded in ACBMP.exe.
+        AddGameSession(t);
+        t.Add(GameSession.ProtocolId, GameSession.MethodSearchSessions,
+            (rmc, in c) => GameSession.BuildSearchSessionsResult(rmc, c.Pid, c.TitleId, excludeOwn: true));
+        t.Add(GameSession.ProtocolId, BrotherhoodServices.MethodGetInvitationsReceived,
+            (rmc, in _) => GameSession.BuildEmptyListResult(rmc, "GetInvitationsReceived"));
+        t.Add(FutureSoldierServices.Friends.ProtocolId, FutureSoldierServices.Friends.MethodGetDetailedList,
+            (rmc, in _) => FutureSoldierServices.Friends.BuildGetDetailedListResult(rmc));
+        t.Add(BrotherhoodServices.MessagingProtocolId, BrotherhoodServices.MethodGetMessagesHeaders,
+            (rmc, in _) => GameSession.BuildEmptyListResult(rmc, "Messaging.GetMessagesHeaders"));
+        // News (31): the same ids as Far Cry 3's (ACBMP's DDL lists GetChannels,
+        // GetChannelsByTypes, GetSubscribableChannels, GetChannelsByIDs,
+        // GetSubscribedChannels, Subscribe/UnSubscribeChannel, GetNewsHeaders,
+        // GetNewsMessages, GetNumberOfNews). Nothing is published.
+        t.Add(News.ProtocolId, News.MethodGetChannels, (rmc, in _) => News.BuildEmptyListResult(rmc, "GetChannels"));
+        t.Add(News.ProtocolId, News.MethodGetChannelsByTypes, (rmc, in _) => News.BuildEmptyListResult(rmc, "GetChannelsByTypes"));
+        t.Add(News.ProtocolId, News.MethodGetSubscribableChannels, (rmc, in _) => News.BuildEmptyListResult(rmc, "GetSubscribableChannels"));
+        t.Add(News.ProtocolId, BrotherhoodServices.MethodGetChannelsByIds, (rmc, in _) => News.BuildEmptyListResult(rmc, "GetChannelsByIDs"));
+        t.Add(News.ProtocolId, News.MethodGetSubscribedChannels, (rmc, in _) => News.BuildEmptyListResult(rmc, "GetSubscribedChannels"));
+        t.Add(News.ProtocolId, News.MethodGetNewsHeaders, (rmc, in _) => News.BuildEmptyListResult(rmc, "GetNewsHeaders"));
+        t.Add(News.ProtocolId, News.MethodGetNewsMessages, (rmc, in _) => News.BuildGetNewsMessagesResult(rmc));
+        t.Add(News.ProtocolId, News.MethodGetNumberOfNews, (rmc, in _) => News.BuildNumberOfNewsResult(rmc));
+
+        // Hermes RichPresence.SetPresence(u32 id, String data): nothing reads it back yet.
+        t.Add(BrotherhoodServices.RichPresenceProtocolId, BrotherhoodServices.MethodSetPresence,
+            (rmc, in _) => GameSession.BuildVoidResult(rmc, "RichPresence.SetPresence"));
+        t.Add(BrotherhoodServices.RichPresenceProtocolId, BrotherhoodServices.RichPresence.MethodGetPresence,
+            (rmc, in _) => BrotherhoodServices.RichPresence.BuildGetPresenceResult(rmc));
+        t.Add(BrotherhoodServices.UbiNews.ProtocolId, BrotherhoodServices.UbiNews.MethodGetChannel,
+            (rmc, in _) => BrotherhoodServices.UbiNews.BuildGetChannelResult(rmc));
+
+        t.Add(BrotherhoodServices.PlayerStatistics.ProtocolId, 1,
+            (rmc, in c) => BrotherhoodServices.PlayerStatistics.BuildWriteResult(rmc, c.Pid, c.TitleId));
+        t.Add(BrotherhoodServices.PlayerStatistics.ProtocolId, 2,
+            (rmc, in c) => BrotherhoodServices.PlayerStatistics.BuildWriteResult(rmc, c.Pid, c.TitleId));
+        foreach (uint method in BrotherhoodServices.PlayerStatistics.VoidMethods.Except([1u, 2u]))
+            t.Add(BrotherhoodServices.PlayerStatistics.ProtocolId, method,
+                (rmc, in _) => BrotherhoodServices.PlayerStatistics.BuildVoidResult(rmc));
+        foreach (uint method in new[] { BrotherhoodServices.PlayerStatistics.MethodReadPlayerStats, BrotherhoodServices.PlayerStatistics.MethodReadPlayerStatsByBoard })
+            t.Add(BrotherhoodServices.PlayerStatistics.ProtocolId, method,
+                (rmc, in c) =>
+                {
+                    Standalone.LocalTitle? local = Standalone.LocalTitles.ForTitle(c.TitleId);
+                    return BrotherhoodServices.PlayerStatistics.BuildPlayersResult(rmc, c.TitleId, name => local?.FindPid(name));
+                });
+        foreach (uint method in BrotherhoodServices.PlayerStatistics.ListMethods)
+            t.Add(BrotherhoodServices.PlayerStatistics.ProtocolId, method,
+                (rmc, in _) => BrotherhoodServices.PlayerStatistics.BuildEmptyResult(rmc, withCount: false));
+        foreach (uint method in BrotherhoodServices.PlayerStatistics.ListAndCountMethods)
+            t.Add(BrotherhoodServices.PlayerStatistics.ProtocolId, method,
+                (rmc, in _) => BrotherhoodServices.PlayerStatistics.BuildEmptyResult(rmc, withCount: true));
         return t;
     }
 

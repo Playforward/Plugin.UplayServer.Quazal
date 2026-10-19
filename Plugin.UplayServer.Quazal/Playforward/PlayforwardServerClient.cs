@@ -276,21 +276,54 @@ internal sealed class PlayforwardServerClient : IDisposable
         new(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
 
     /// <summary>
-    /// Reports whether a response is usable, logging the two cases an operator
-    /// can actually act on.
+    /// Reports whether a response is usable, logging why when it is not: the
+    /// cases an operator can act on (a wrong secret, a revoked registration)
+    /// as errors, and a single request Playforward will not take from this
+    /// server as a warning.
     /// </summary>
     private static async Task<bool> SucceededAsync(HttpResponseMessage response, HttpMethod method, string path)
     {
         if (response.IsSuccessStatusCode)
             return true;
         if (response.StatusCode == HttpStatusCode.Unauthorized)
+        {
             Log.Error("[playforward] this server's secret was rejected: check Titles[<title>].Playforward.ServerSecret, or rotate it in the admin panel");
-        else if (response.StatusCode == HttpStatusCode.Forbidden)
-            Log.Error("[playforward] this server's registration has been revoked; it will not appear in the directory until an admin registers it again");
-        else
+            return false;
+        }
+        if (response.StatusCode != HttpStatusCode.Forbidden)
+        {
             Log.Warning("[playforward] {Method} {Path} answered {Status}", method, path, (int)response.StatusCode);
+            return false;
+        }
+
+        string? code = await ErrorCodeAsync(response).ConfigureAwait(false);
+        if (code == PlayerNotAdmitted)
+            Log.Warning("[playforward] {Method} {Path} refused: that player did not join this server through Playforward, so it may not act on them", method, path);
+        else if (code == TitleStateVerifiedOnly)
+            Log.Warning("[playforward] {Method} {Path} refused: only a verified server may change title-wide state; this one keeps what it learned in memory", method, path);
+        else
+            Log.Error("[playforward] this server's registration has been revoked; it will not appear in the directory until an admin registers it again");
 
         return false;
+    }
+
+    /// <summary>Playforward's code for a server acting on a player who did not choose it.</summary>
+    private const string PlayerNotAdmitted = "player_not_admitted";
+
+    /// <summary>Playforward's code for a community server writing title-wide state.</summary>
+    private const string TitleStateVerifiedOnly = "title_state_verified_only";
+
+    private static async Task<string?> ErrorCodeAsync(HttpResponseMessage response)
+    {
+        try
+        {
+            string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            return JsonSerializer.Deserialize<ErrorResponse>(body, JsonOptions)?.Code;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static void LogFailure(HttpMethod method, string path, Exception exception) =>
@@ -355,6 +388,18 @@ internal sealed class RegistrationResponse
     public string TitleId { get; init; } = string.Empty;
     public string Name { get; init; } = string.Empty;
     public string PublicUrl { get; init; } = string.Empty;
+
+    /// <summary>
+    /// "community" or "verified". A community server's scores go to unranked
+    /// boards and it may not change title-wide state; empty from a
+    /// Playforward older than community hosting, which trusted every server.
+    /// </summary>
+    public string Trust { get; init; } = string.Empty;
+}
+
+internal sealed class ErrorResponse
+{
+    public string? Code { get; init; }
 }
 
 internal sealed class ResolvePrincipalRequest

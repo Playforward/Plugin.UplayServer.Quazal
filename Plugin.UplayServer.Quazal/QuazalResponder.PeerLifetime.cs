@@ -26,6 +26,7 @@ internal sealed partial class QuazalResponder
     /// </summary>
     public void StartSweeping()
     {
+        StartRetransmitting();
         TimeSpan interval = TimeSpan.FromSeconds(settings.PeerSweepIntervalSeconds);
         _sweep ??= new Timer(_ =>
         {
@@ -85,14 +86,25 @@ internal sealed partial class QuazalResponder
     }
 
     /// <summary>
-    /// Tells each Playforward title which of its players' games are still
-    /// talking, so the login bindings and launches they rely on stay, and the
+    /// Tells each Playforward and standalone title which of its players'
+    /// games are still talking, so the login bindings and launches they rely on stay, and the
     /// ones nobody is using end; see <see cref="Playforward.PlayforwardGateway.KeepAlive"/>.
     /// </summary>
     private void ReportLivePlayers()
     {
         foreach (QuazalTitle title in _titlesByPort.Values.Distinct())
         {
+            if (Standalone.LocalTitles.ForTitle(title) is { } local)
+            {
+                Dictionary<uint, IPAddress> playing = [];
+                foreach (((IPEndPoint Remote, int LocalPort, byte SourcePort) key, Peer peer) in _peers)
+                {
+                    if (ReferenceEquals(peer.Title, title) && peer.AuthenticatedPid is { } pid)
+                        playing[pid] = key.Remote.Address;
+                }
+                local.KeepAlive(playing);
+                continue;
+            }
             if (Playforward.PlayforwardTitles.ForTitle(title)?.Gateway is not { } gateway)
                 continue;
 

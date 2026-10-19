@@ -1,6 +1,6 @@
 namespace GameClientTestHarness;
 
-internal enum HarnessMode { SelfTest, Bridge, LaunchServer, Help }
+internal enum HarnessMode { SelfTest, Bridge, LaunchServer, Login, Help }
 
 internal sealed class HarnessOptions
 {
@@ -30,6 +30,7 @@ internal sealed class HarnessOptions
                 "selftest" => HarnessMode.SelfTest,
                 "bridge" => HarnessMode.Bridge,
                 "launchserver" => HarnessMode.LaunchServer,
+                "login" => HarnessMode.Login,
                 _ => HarnessMode.Help,
             };
             index = 1;

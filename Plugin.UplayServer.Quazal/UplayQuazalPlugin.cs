@@ -41,6 +41,14 @@ public sealed class UplayQuazalPlugin : ServerPlugin<QuazalSettings>
             return;
         }
 
+        string[] standaloneErrors = Config.Standalone.Validate(Config).ToArray();
+        if (standaloneErrors.Length > 0)
+        {
+            foreach (string error in standaloneErrors)
+                Log.Error("[quazal] invalid standalone configuration: {Error}", error);
+            return;
+        }
+
         string[] peerErrors = Config.ValidatePeerLimits().ToArray();
         if (peerErrors.Length > 0)
         {
@@ -52,6 +60,13 @@ public sealed class UplayQuazalPlugin : ServerPlugin<QuazalSettings>
         if (!ResolveTitles())
             return;
 
+        if (string.IsNullOrWhiteSpace(Config.PublicHost))
+        {
+            Config.PublicHost = QuazalSettings.ResolvePublicHost(Config.PublicHost);
+            Log.Information("[quazal] PublicHost not set; advertising this machine's LAN address {Host}. Set PublicHost if players reach this server through a port forward",
+                Config.PublicHost);
+        }
+
         try
         {
             StartPlayforward();
@@ -61,6 +76,12 @@ public sealed class UplayQuazalPlugin : ServerPlugin<QuazalSettings>
             Log.Error(exception, "[playforward] failed to start; continuing with Playforward disabled");
             StopPlayforward();
         }
+
+        if (!KeepOnlyTitlesPlayforwardCovers())
+            return;
+
+        StartStandalone();
+        AttachOnlineData();
 
         Playforward.PartySeating.Enabled = Config.Playforward.SeatPartiesTogether;
 
@@ -84,6 +105,31 @@ public sealed class UplayQuazalPlugin : ServerPlugin<QuazalSettings>
         Log.Information("[quazal] PRUDP V0 listener attached; transport ACKs={Acks}; authenticated secure CONNECT={SecureConnect}; signing identity={Identity}",
             Config.EnableTransportAcks, Config.EnableAuthenticatedSecureConnect,
             _responder.HasSigningIdentity ? "loaded" : "not configured");
+    }
+
+    /// <summary>
+    /// With Playforward required (<see cref="Playforward.PlayforwardSettings.RequireOnEveryTitle"/>),
+    /// stops serving every title whose Playforward half did not come up: its
+    /// ports stop being ours, so their packets are dropped rather than
+    /// answered with a local login. Returns false when no title is left.
+    /// </summary>
+    private bool KeepOnlyTitlesPlayforwardCovers()
+    {
+        if (!Config.Playforward.Enabled || !Config.Playforward.RequireOnEveryTitle)
+            return true;
+
+        HashSet<QuazalTitle> covered = _playforward.Select(p => p.Title).ToHashSet();
+        foreach (QuazalTitle title in _titlesByPort.Values.Distinct().Where(t => !covered.Contains(t)))
+            Log.Error("[quazal] not serving {Title}: its Playforward half did not start (see above), and Playforward.RequireOnEveryTitle refuses to fall back to local logins", title);
+
+        _titlesByPort = _titlesByPort
+            .Where(entry => covered.Contains(entry.Value))
+            .ToDictionary(entry => entry.Key, entry => entry.Value);
+        if (_titlesByPort.Count > 0)
+            return true;
+
+        Log.Error("[quazal] no title is left to serve; fix the Playforward errors above and restart");
+        return false;
     }
 
     /// <summary>
@@ -171,30 +217,68 @@ public sealed class UplayQuazalPlugin : ServerPlugin<QuazalSettings>
             return;
         }
 
-        AttachOnlineData();
         MergePlayforwardRoutes();
         StartSessionReporting();
     }
 
     /// <summary>
+    /// Serves every title Playforward does not cover standalone: any player
+    /// name logs in, with its PID and progress kept on this machine. A title
+    /// whose store cannot be opened is still served, as a LAN title.
+    /// </summary>
+    private void StartStandalone()
+    {
+        if (!Config.Standalone.Enabled)
+        {
+            Log.Information("[standalone] off: titles without Playforward take only the configured Accounts, and keep progress for this run only");
+            return;
+        }
+
+        foreach (QuazalTitle title in _titlesByPort.Values.Distinct())
+        {
+            if (Playforward.PlayforwardTitles.ForTitle(title) is not null)
+                continue;
+            Standalone.LocalTitle? local = Standalone.LocalTitle.Start(Config.Standalone, title);
+            if (local is null)
+            {
+                Log.Error("[standalone] {Title} could not open its player store (see above); only configured Accounts can log in to it", title);
+                continue;
+            }
+            Standalone.LocalTitles.Register(local);
+            Log.Information("[standalone] serving {Title} without Playforward: open logins by name, progress kept in {Directory}",
+                title, Path.GetFullPath(Path.Combine(Config.Standalone.DataDirectory, title.TitleId)));
+        }
+
+        if (Standalone.LocalTitles.All.Count > 0 && IsLoopback(Config.PublicHost))
+            Log.Warning("[standalone] PublicHost is {Host}: the login reply tells every client to connect there, so only this machine can play. Set it to the address players reach this server on",
+                Config.PublicHost);
+    }
+
+    private static bool IsLoopback(string host) =>
+        string.IsNullOrWhiteSpace(host) || host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+        (IPAddress.TryParse(host, out IPAddress? address) && IPAddress.IsLoopback(address));
+
+    /// <summary>
     /// Puts the online-data store (Far Cry 3's protocol 106) behind the
-    /// player-data store of the title that speaks it. The store is keyed by
-    /// pid alone, so it can serve one title
+    /// player store of the title that speaks it: Playforward's, or this
+    /// machine's for a standalone title. The store is keyed by pid alone, so
+    /// it can serve one title.
     /// </summary>
     private void AttachOnlineData()
     {
-        Playforward.PlayforwardTitle[] farCry3 = _playforward
-            .Where(p => p.Title.ProtocolFamily == QuazalProtocolFamily.FarCry3)
+        QuazalTitle[] farCry3 = _titlesByPort.Values.Distinct()
+            .Where(title => title.ProtocolFamily == QuazalProtocolFamily.FarCry3 && Standalone.PlayerStores.ForTitle(title.TitleId) is not null)
             .ToArray();
         if (farCry3.Length == 0)
             return;
         if (farCry3.Length > 1)
         {
-            Log.Error("[playforward] {Count} titles speak Far Cry 3's online-data protocol but the store can hold one; saved progress is attached to {Title} only",
-                farCry3.Length, farCry3[0].Title);
+            Log.Error("[progress] {Count} titles speak Far Cry 3's online-data protocol but the store can hold one; saved progress is attached to {Title} only",
+                farCry3.Length, farCry3[0]);
         }
-        Playforward.PlayforwardTitle owner = farCry3[0];
-        OnlineDataStore.Attach(owner.TitleId, owner.Store, pid => QuazalSettings.IsPlayforwardPid(owner.Title, pid));
+        QuazalTitle owner = farCry3[0];
+        OnlineDataStore.Attach(owner.TitleId, Standalone.PlayerStores.ForTitle(owner.TitleId)!,
+            pid => Standalone.PlayerStores.ForPlayer(owner.TitleId, pid) is not null);
     }
 
     /// <summary>
@@ -256,6 +340,7 @@ public sealed class UplayQuazalPlugin : ServerPlugin<QuazalSettings>
 
     private void StopPlayforward()
     {
+        Standalone.LocalTitles.Clear();
         Playforward.PlayforwardTitles.Clear();
         foreach (Playforward.PlayforwardTitle playforward in _playforward)
             playforward.Dispose();

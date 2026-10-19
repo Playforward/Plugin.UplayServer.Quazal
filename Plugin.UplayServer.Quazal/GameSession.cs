@@ -222,12 +222,23 @@ internal static class GameSession
     /// header meaning is unconfirmed for this method (no existing session id to
     /// key off), but the shape matches UpdateSession's exactly.
     /// </summary>
-    public static byte[] BuildSearchSessionsResult(RmcRequest request, uint searchingPid, string titleId)
+    /// <param name="excludeOwn">
+    /// Leave out sessions the searching player hosts or is in. Assassin's
+    /// Creed Brotherhood keeps searching after it creates its own session and,
+    /// handed that session back, tries to join itself until it crashes.
+    /// </param>
+    public static byte[] BuildSearchSessionsResult(RmcRequest request, uint searchingPid, string titleId, bool excludeOwn = false)
     {
         if (TryReadProperties(request, 0, out uint headerA, out uint headerB, out Dictionary<uint, int> criteria))
         {
             int? playlist = criteria.TryGetValue(0x64, out int p) ? p : null;
             var candidates = playlist.HasValue ? GameSessionStore.FindByType(titleId, headerA) : [];
+            if (excludeOwn)
+            {
+                candidates = candidates
+                    .Where(c => c.HostPid != searchingPid && !GameSessionStore.IsMember(titleId, headerA, c.SessionId, searchingPid))
+                    .ToList();
+            }
 
             candidates = Playforward.PartySeating.Steer(
                 Playforward.PlayforwardTitles.ForTitle(titleId)?.Gateway, searchingPid, candidates);

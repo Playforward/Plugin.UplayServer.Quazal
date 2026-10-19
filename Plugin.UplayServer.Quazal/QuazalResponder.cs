@@ -31,6 +31,8 @@ internal sealed partial class QuazalResponder : IDisposable
         TimeProvider? time = null)
     {
         this.settings = settings;
+        // Every reply that names a server names this one; never an empty address.
+        settings.PublicHost = QuazalSettings.ResolvePublicHost(settings.PublicHost);
         _titlesByPort = titlesByPort;
         _time = time ?? TimeProvider.System;
         // One identity document may back several titles; load each once.
@@ -84,6 +86,8 @@ internal sealed partial class QuazalResponder : IDisposable
         public uint ServerCallId { get; set; } = 50_000;
         /// <summary>The Rendez-Vous connection id Register handed this session, once it has.</summary>
         public uint? ConnectionId { get; set; }
+        /// <summary>This server's reliable packets to this session that it has not yet seen ACKed.</summary>
+        public ReliableOutbox Outbox { get; } = new();
 
         // Written by the receive path and read by the sweep, on different threads.
         private long _lastHeard;
@@ -321,8 +325,8 @@ internal sealed partial class QuazalResponder : IDisposable
                 }
                 if (reply is null)
                 {
-                    Log.Warning("[quazal] secure CONNECT on :{Port} from {Source} could not be opened: {Clear}",
-                        localPort, source, Convert.ToHexString(clear));
+                    Log.Warning("[quazal] secure CONNECT on :{Port} from {Source} could not be opened ({Length} bytes, starting {Clear})",
+                        localPort, source, clear.Length, Convert.ToHexString(clear.AsSpan(0, Math.Min(LoggedPayloadBytes, clear.Length))));
                 }
                 else
                 {
@@ -342,13 +346,28 @@ internal sealed partial class QuazalResponder : IDisposable
                 existing.RmcResponseCounter = 0;
                 existing.ServerSequenceId = 1;
                 existing.LastClientEcdhBlob = request.Payload.ToArray();
-                (existing.SecureConnectSignature, existing.SecureConnectExtension) =
-                    CreateAuthenticatedSecureConnectEnvelope(existing, signingIdentity);
-                existing.SecureSessionKey = DeriveSecureSessionKey(existing.SecureAgreement!, request.Payload);
+                try
+                {
+                    (existing.SecureConnectSignature, existing.SecureConnectExtension) =
+                        CreateAuthenticatedSecureConnectEnvelope(existing, signingIdentity);
+                    existing.SecureSessionKey = DeriveSecureSessionKey(existing.SecureAgreement!, request.Payload);
+                }
+                catch (CryptographicException ex)
+                {
+                    // A client key that is not a point on P-256 lands here.
+                    ClearSecureState(existing);
+                    existing.LastClientEcdhBlob = null;
+                    Log.Warning("[quazal] secure CONNECT from {Source} carried an unusable P-256 key: {Message}",
+                        source, ex.Message);
+                    return [];
+                }
                 Log.Information("[quazal] generated authenticated P-256 secure-CONNECT envelope for {Source}", source);
             }
             return needsAck ? [ConnectAcknowledge(request, existing).ToArray(existing.AccessKeyChecksum)] : [];
         }
+
+        if (request.PacketType == PacketType.Data && request.Flags.HasFlag(PacketFlags.Ack) && request.Payload.Length == 0)
+            return AcknowledgeReliable(existing, request.SequenceId);
 
         bool reliableData = request.PacketType == PacketType.Data && request.Flags.HasFlag(PacketFlags.Reliable);
         if (reliableData && existing.Answered.TryGetValue(request.SequenceId, out List<byte[]>? again))
@@ -544,6 +563,13 @@ internal sealed partial class QuazalResponder : IDisposable
             return null;
         }
 
+        if (peer.PendingFragments.Count + rmcBytes.Length > MaxRmcMessageBytes)
+        {
+            Log.Warning("[quazal] DATA seq={Sequence} from {Source}: fragments would pass {Limit} bytes; dropped the request",
+                request.SequenceId, source, MaxRmcMessageBytes);
+            peer.PendingFragments.Clear();
+            return null;
+        }
         if (request.FragmentId != 0)
         {
             peer.PendingFragments.AddRange(rmcBytes);
@@ -615,7 +641,7 @@ internal sealed partial class QuazalResponder : IDisposable
                 rmc.ProtocolId, rmc.CallId, rmc.MethodId, result, rmc.ExtendedProtocolId);
         }
 
-        var packets = new List<byte[]>();
+        var packets = new List<(ushort Sequence, byte[] Bytes)>();
         var wireLengths = new List<int>();
         int fragmentCount = (response.Length + MaxFragmentPayload - 1) / MaxFragmentPayload;
         if (fragmentCount < 1) fragmentCount = 1;
@@ -642,7 +668,7 @@ internal sealed partial class QuazalResponder : IDisposable
             PrudpPacketV0 responsePacket = SecureDataPacket(request, peer, encrypted);
             responsePacket.FragmentId =
                 index == fragmentCount - 1 ? (byte)0 : (byte)(index + 1);
-            packets.Add(responsePacket.ToArray(peer.AccessKeyChecksum));
+            packets.Add((responsePacket.SequenceId, responsePacket.ToArray(peer.AccessKeyChecksum)));
             wireLengths.Add(encrypted.Length);
         }
 
@@ -652,7 +678,7 @@ internal sealed partial class QuazalResponder : IDisposable
             result?.Length ?? 0, response.Length, wireLengths.Sum(),
             fragmentCount > 1 ? $" in {fragmentCount} fragments" : string.Empty);
 
-        return packets;
+        return SendReliable(peer, packets);
     }
 
     /// <summary>
@@ -684,6 +710,9 @@ internal sealed partial class QuazalResponder : IDisposable
     }
 
     private const int RmcHeaderBytes = 13;
+
+    /// <summary>How much of a payload nobody has authenticated is copied into the log.</summary>
+    private const int LoggedPayloadBytes = 64;
 
     internal static string ParametersForLog(RmcRequest rmc) =>
         rmc.ServiceId == TicketGranting.ProtocolId
@@ -908,7 +937,8 @@ internal sealed partial class QuazalResponder : IDisposable
             if (rmc.Length < offset + 2) return false;
             ushort protocolLength = BinaryPrimitives.ReadUInt16LittleEndian(rmc[offset..]);
             offset += 2;
-            if (rmc.Length < offset + protocolLength + 1 + 4 + 2) return false;
+            // Both strings carry their NUL, so a zero length is not a string.
+            if (protocolLength == 0 || rmc.Length < offset + protocolLength + 1 + 4 + 2) return false;
             string protocol = NulTerminatedAscii(rmc.Slice(offset, protocolLength));
             offset += protocolLength;
             offset += 1; // request flag byte (observed value 1)
@@ -916,7 +946,7 @@ internal sealed partial class QuazalResponder : IDisposable
             offset += 4;
             ushort methodLength = BinaryPrimitives.ReadUInt16LittleEndian(rmc[offset..]);
             offset += 2;
-            if (rmc.Length < offset + methodLength) return false;
+            if (methodLength == 0 || rmc.Length < offset + methodLength) return false;
             string method = NulTerminatedAscii(rmc.Slice(offset, methodLength)).TrimEnd('*');
             message = new NamedRmcMessage(protocol, method, callId);
             return true;
@@ -975,6 +1005,13 @@ internal sealed partial class QuazalResponder : IDisposable
         return decryptor.TransformFinalBlock(payload[16..].ToArray(), 0, payload.Length - 16);
     }
 
+    /// <summary>
+    /// The most RMC bytes one request may inflate or reassemble to. zlib
+    /// expands up to ~1000:1, so without a bound one datagram from anybody
+    /// is a megabyte allocation, and fragments a peer never finishes pile up.
+    /// </summary>
+    internal const int MaxRmcMessageBytes = 1 << 20;
+
     private static bool TryDecompressSecureRmc(ReadOnlySpan<byte> clear, out byte[] rmc)
     {
         rmc = [];
@@ -984,7 +1021,21 @@ internal sealed partial class QuazalResponder : IDisposable
         using MemoryStream compressed = new(clear[1..].ToArray(), writable: false);
         using ZLibStream zlib = new(compressed, CompressionMode.Decompress);
         using MemoryStream output = new();
-        zlib.CopyTo(output);
+        Span<byte> chunk = stackalloc byte[4096];
+        try
+        {
+            int read;
+            while ((read = zlib.Read(chunk)) > 0)
+            {
+                if (output.Length + read > MaxRmcMessageBytes)
+                    return false;
+                output.Write(chunk[..read]);
+            }
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
         rmc = output.ToArray();
         return rmc.Length > 0;
     }
@@ -1128,6 +1179,7 @@ internal sealed partial class QuazalResponder : IDisposable
     private static void ClearSecureState(Peer peer)
     {
         peer.PendingFragments.Clear();
+        peer.Outbox.Clear();
         peer.Answered.Clear();
         peer.AnsweredOrder.Clear();
         peer.SecureAgreement?.Dispose();
@@ -1200,6 +1252,7 @@ internal sealed partial class QuazalResponder : IDisposable
     public void Dispose()
     {
         StopSweeping();
+        StopRetransmitting();
         foreach (ECDsa? identity in _signingIdentities.Values)
             identity?.Dispose();
         _signingIdentities.Clear();
@@ -1285,8 +1338,12 @@ internal sealed partial class QuazalResponder : IDisposable
 
     private static PrudpPacketV0 NatEchoReply(PrudpPacketV0 request, IPEndPoint source)
     {
-        Log.Information("[quazal] NAT-echo probe from {Source} ({Length} bytes): {Payload}",
-            source, request.Payload.Length, Convert.ToHexString(request.Payload));
+        // Anybody can send these, from any address they like: log a bounded
+        // prefix, and each endpoint at most once per interval.
+        if (ShouldLogNatDetect(source))
+            Log.Information("[quazal] NAT-echo probe from {Source} ({Length} bytes): {Payload}",
+                source, request.Payload.Length,
+                Convert.ToHexString(request.Payload.AsSpan(0, Math.Min(LoggedPayloadBytes, request.Payload.Length))));
         byte[] observed = new byte[6];
         source.Address.MapToIPv4().TryWriteBytes(observed, out _);
         BinaryPrimitives.WriteUInt16LittleEndian(observed.AsSpan(4), (ushort)source.Port);

@@ -178,12 +178,9 @@ internal static class BlacklistStatistics
         return Players.GetOrAdd((titleId, pid), _ => new RowSet());
     }
 
-    /// <summary>The title's Playforward store, when the pid is one of its principals.</summary>
-    private static Playforward.IProgressStore? StoreFor(string titleId, uint pid)
-    {
-        Playforward.PlayforwardTitle? title = Playforward.PlayforwardTitles.ForTitle(titleId);
-        return title?.Gateway.ForPid(pid) is null ? null : title.Store;
-    }
+    /// <summary>The store the pid's progress is kept in (Playforward's or this machine's), or null when it is kept for this run only.</summary>
+    private static Playforward.IProgressStore? StoreFor(string titleId, uint pid) =>
+        Standalone.PlayerStores.ForPlayer(titleId, pid);
 
     private static bool TryPrime(string titleId, uint pid, out RowSet rows)
     {
@@ -199,7 +196,7 @@ internal static class BlacklistStatistics
         if (blobs is null)
         {
             Primed[(titleId, pid)] = DateTimeOffset.UtcNow;
-            Log.Warning("[progress] could not load pid={Pid}'s {Title} player stats from Playforward; serving what this session holds", pid, titleId);
+            Log.Warning("[progress] could not load pid={Pid}'s {Title} player stats from {Store}; serving what this session holds", pid, titleId, Standalone.PlayerStores.Describe(titleId));
             return false;
         }
         var loaded = new RowSet();
@@ -208,7 +205,7 @@ internal static class BlacklistStatistics
             Log.Warning("[progress] pid={Pid}'s {Title} player stats blob could not be read; starting them over", pid, titleId);
         rows = Players.GetOrAdd((titleId, pid), loaded);
         Primed[(titleId, pid)] = null;
-        Log.Information("[progress] pid={Pid}'s {Title} player stats loaded from Playforward: {Rows} row(s)", pid, titleId, loaded.Rows.Count);
+        Log.Information("[progress] pid={Pid}'s {Title} player stats loaded from {Store}: {Rows} row(s)", pid, titleId, Standalone.PlayerStores.Describe(titleId), loaded.Rows.Count);
         return true;
     }
 
@@ -216,7 +213,7 @@ internal static class BlacklistStatistics
     {
         Playforward.IProgressStore? store = StoreFor(titleId, pid);
         if (store is not null && !store.SaveBlob(pid, BlobNamespace, RowsKey, Serialize(rows)))
-            Log.Warning("[progress] could not save pid={Pid}'s {Title} player stats to Playforward; keeping them in memory for this session", pid, titleId);
+            Log.Warning("[progress] could not save pid={Pid}'s {Title} player stats to {Store}; keeping them in memory for this session", pid, titleId, Standalone.PlayerStores.Describe(titleId));
     }
 
     private static byte[] Serialize(RowSet rows)
@@ -418,8 +415,8 @@ internal static class BlacklistStatistics
     /// </summary>
     internal static IReadOnlyList<Ranked> Ranking(string titleId, LeaderboardQuery query)
     {
-        Playforward.PlayforwardTitle? title = Playforward.PlayforwardTitles.ForTitle(titleId);
-        if (title is null)
+        Playforward.IProgressStore? store = Standalone.PlayerStores.ForTitle(titleId);
+        if (store is null)
             return [];
         string board = ScoreBoard(SourceBoard(query.Board), query.Context);
         IReadOnlyList<Playforward.StoredScore>? scores;
@@ -427,10 +424,10 @@ internal static class BlacklistStatistics
             scores = cached.Scores;
         else
         {
-            scores = title.Store.TopScores(board, RankDepth);
+            scores = store.TopScores(board, RankDepth);
             if (scores is null)
             {
-                Log.Warning("[progress] could not read the {Title} leaderboard {Board} from Playforward", titleId, board);
+                Log.Warning("[progress] could not read the {Title} leaderboard {Board} from {Store}", titleId, board, Standalone.PlayerStores.Describe(titleId));
                 return [];
             }
             TopCache[(titleId, board)] = (scores, DateTimeOffset.UtcNow);
